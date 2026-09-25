@@ -399,6 +399,8 @@ PYTHONPATH=tools uv run python -m bench_inference --model-config $OMNIVGGT_OMEGA
 Training also accepts `OMNIVGGT_OPTIMIZER=amuse` (AMUSE, [kjeiun/amuse](https://github.com/kjeiun/amuse),
 Apache-2.0, vendored unmodified in `omnivggt/optim/`): Muon for hidden-layer weight matrices and
 AdamW-style updates for the rest, schedule-free (warm-up only); checkpoints store its averaged weights.
+With a trainable image encoder (`OMNIVGGT_PATCH_EMBED_FREEZE=0`) its parameters get separate AMUSE groups
+with the learning rates scaled by `amuse_patch_embed_lr_scale` (0.5, the same ratio as `lr_patch_embed / lr`).
 
 **Results on our own RGB-D sequences** (variant V5: inter-frame blocks from VGGT-Ω, i.e. FAIR
 Noncommercial weights, everything else from OmniVGGT; two sequences of a rail-mounted RGB-D camera; fine-tuned with

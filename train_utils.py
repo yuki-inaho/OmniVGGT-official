@@ -338,13 +338,20 @@ def _build_amuse(model: torch.nn.Module, cfg: Any) -> torch.optim.Optimizer:
     muon_names, fallback_names = classify_amuse_parameters(model)
     parameters = dict(model.named_parameters())
     weight_decay = cfg.get("amuse_weight_decay", 0.01)
-    groups = [
-        {"params": [parameters[n] for n in muon_names], "use_muon": True, "lr": cfg.get("amuse_muon_lr", 1e-4),
-         "momentum": cfg.get("amuse_momentum", 0.95), "aux_update_type": "adamw", "weight_decay": weight_decay,
-         "name": "amuse_muon"},
-        {"params": [parameters[n] for n in fallback_names], "use_muon": False, "lr": cfg.get("amuse_aux_lr", 1e-5),
-         "beta2": cfg.get("amuse_beta2", 0.999), "weight_decay": weight_decay, "name": "amuse_fallback"},
-    ]
+    muon = {"use_muon": True, "lr": cfg.get("amuse_muon_lr", 1e-4), "momentum": cfg.get("amuse_momentum", 0.95),
+            "aux_update_type": "adamw", "weight_decay": weight_decay, "name": "amuse_muon"}
+    fallback = {"use_muon": False, "lr": cfg.get("amuse_aux_lr", 1e-5), "beta2": cfg.get("amuse_beta2", 0.999),
+                "weight_decay": weight_decay, "name": "amuse_fallback"}
+    # A trainable image encoder gets its own groups with the learning rates scaled down, as lr_patch_embed does for AdamW.
+    encoder_scale = cfg.get("amuse_patch_embed_lr_scale", 1.0)
+    groups = []
+    for template, names in ((muon, muon_names), (fallback, fallback_names)):
+        encoder = [n for n in names if n.startswith("aggregator.patch_embed.")]
+        rest = [n for n in names if not n.startswith("aggregator.patch_embed.")]
+        groups.append({**template, "params": [parameters[n] for n in rest]})
+        if encoder:
+            groups.append({**template, "params": [parameters[n] for n in encoder], "lr": template["lr"] * encoder_scale,
+                           "name": f"{template['name']}_patch_embed"})
     estimated_steps = cfg.get("num_train_epochs", 1) * cfg.get("steps_per_epoch", 1) // cfg.get("gradient_accumulation_steps", 1)
     optimizer = AMUSE(
         groups,
@@ -355,7 +362,8 @@ def _build_amuse(model: torch.nn.Module, cfg: Any) -> torch.optim.Optimizer:
         rho=cfg.get("amuse_rho", 0.3),
         r=cfg.get("amuse_r", 0.0),
     )
-    logger.info(f"Optimizer created: AMUSE (muon={len(muon_names)} tensors, fallback={len(fallback_names)} tensors)")
+    for group in groups:
+        logger.info(f"AMUSE group {group['name']}: {len(group['params'])} tensors, lr {group['lr']:g}")
     return optimizer
 
 

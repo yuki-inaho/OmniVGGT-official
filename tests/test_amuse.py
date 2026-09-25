@@ -159,3 +159,35 @@ def test_amuse_rejects_point_head_mismatch_like_adamw():
     PartialState()
     with pytest.raises(ValueError, match="point_head"):
         train_utils.build_optimizer(_tiny(), {**AMUSE_CFG, "enable_point": True})
+
+
+def _group_names(optimizer, model):
+    names = {id(p): n for n, p in model.named_parameters()}
+    return {g["name"]: (g["lr"], [names[id(p)] for p in g["params"]]) for g in optimizer.param_groups}
+
+
+def test_amuse_encoder_groups_when_unfrozen():
+    PartialState()
+    model = _tiny()
+    cfg = {**AMUSE_CFG, "patch_embed_freeze": False, "amuse_patch_embed_lr_scale": 0.5}
+    groups = _group_names(train_utils.build_optimizer(model, cfg), model)
+    assert {name: lr for name, (lr, _) in groups.items()} == {
+        "amuse_muon": 1e-4,
+        "amuse_fallback": 1e-5,
+        "amuse_muon_patch_embed": 5e-5,
+        "amuse_fallback_patch_embed": 5e-6,
+    }
+    encoder = {n for n, p in model.named_parameters() if n.startswith("aggregator.patch_embed.")}
+    assert encoder and all(p.requires_grad for n, p in model.named_parameters() if n in encoder)
+    assert set(groups["amuse_muon_patch_embed"][1]) | set(groups["amuse_fallback_patch_embed"][1]) == encoder
+    assert groups["amuse_muon_patch_embed"][1] and groups["amuse_fallback_patch_embed"][1]
+    listed = [n for _, members in groups.values() for n in members]
+    assert sorted(listed) == sorted(n for n, p in model.named_parameters() if p.requires_grad)
+
+
+def test_amuse_frozen_encoder_keeps_two_groups():
+    PartialState()
+    model = _tiny()
+    groups = _group_names(train_utils.build_optimizer(model, {**AMUSE_CFG, "amuse_patch_embed_lr_scale": 0.5}), model)
+    assert set(groups) == {"amuse_muon", "amuse_fallback"}
+    assert not any(n.startswith("aggregator.patch_embed.") for _, members in groups.values() for n in members)

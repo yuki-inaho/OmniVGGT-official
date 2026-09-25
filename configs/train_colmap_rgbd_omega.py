@@ -78,6 +78,7 @@ amuse_weight_lr_power = 2.0
 amuse_warmup_ratio = 0.05
 amuse_weight_decay = 0.01
 amuse_weight_decay_at_y = 0.0
+amuse_patch_embed_lr_scale = 0.5  # image encoder, when trainable: same ratio as lr_patch_embed / lr below
 adam_beta1 = 0.9
 adam_beta2 = 0.95
 adam_epsilon = 1e-8
