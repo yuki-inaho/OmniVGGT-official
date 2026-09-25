@@ -14,6 +14,7 @@ License: MIT
 import os
 import math
 import logging
+from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import torch
@@ -21,6 +22,7 @@ import wandb
 import numpy as np
 import accelerate
 import transformers
+from safetensors.torch import load_file as load_safetensors
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
@@ -170,6 +172,34 @@ def setup_tensorboard(cfg: Any, save_dir: str) -> Optional[SummaryWriter]:
     return None
 
 
+def load_initial_weights(model: torch.nn.Module, cfg: Any) -> str:
+    """Load the starting weights.
+
+    ``init_checkpoint`` (a local ``.safetensors`` file, e.g. the released OmniVGGT
+    weights) is loaded strictly and must exist; otherwise the original
+    ``model_url`` behaviour (VGGT-1B from the hub) is used.
+    """
+    init_checkpoint = cfg.get("init_checkpoint")
+    if init_checkpoint:
+        path = Path(init_checkpoint)
+        if not path.is_file():
+            raise FileNotFoundError(f"init_checkpoint does not exist: {path}")
+        model.load_state_dict(load_safetensors(str(path)), strict=True)
+        return f"init_checkpoint:{path.name}"
+
+    model_url = cfg.get("model_url", "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt")
+    logger.info(f"Loading pretrained weights from {model_url}")
+    try:
+        state_dict = torch.hub.load_state_dict_from_url(model_url)
+        model.load_state_dict(state_dict, strict=cfg.get("model_load_strict", False))
+        logger.info("Pretrained weights loaded successfully")
+        return f"model_url:{model_url}"
+    except Exception as e:
+        logger.warning(f"Failed to load pretrained weights: {e}")
+        logger.warning("Training from scratch...")
+        return "scratch"
+
+
 def load_model(cfg: Any, device: torch.device) -> Tuple[OmniVGGT, torch.dtype]:
     """
     Load and initialize the OmniVGGT model.
@@ -193,17 +223,8 @@ def load_model(cfg: Any, device: torch.device) -> Tuple[OmniVGGT, torch.dtype]:
     #     logger.info(f"Parameter {idx}: {name} - Shape: {param.shape}")
 
     # Load pretrained weights
-    model_url = cfg.get("model_url", "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt")
-    logger.info(f"Loading pretrained weights from {model_url}")
-    
-    try:
-        state_dict = torch.hub.load_state_dict_from_url(model_url)
-        model.load_state_dict(state_dict, strict=cfg.get("model_load_strict", False))
-        logger.info("Pretrained weights loaded successfully")
-    except Exception as e:
-        logger.warning(f"Failed to load pretrained weights: {e}")
-        logger.warning("Training from scratch...")
-    
+    logger.info(f"Initial weights: {load_initial_weights(model, cfg)}")
+
     # Set requires_grad
     model.requires_grad_(cfg.get("model_requires_grad", True))
     

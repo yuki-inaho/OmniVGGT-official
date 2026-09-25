@@ -1,0 +1,76 @@
+[project]
+name = "omnivggt"
+version = "0.1.0"
+description = "OmniVGGT: Omni-Modality Driven Visual Geometry Grounded Transformer"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = "==3.10.*"
+dependencies = [
+    # README: pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url .../cu128
+    # cu128 builds include sm_120 (RTX 50xx / Blackwell); resolved from the pytorch-cu128 index below.
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "torchaudio==2.7.0",
+    # requirements.txt (core)
+    "numpy",
+    "Pillow",
+    "opencv-python",
+    "scipy",
+    "einops",
+    "safetensors",
+    "trimesh",
+    "matplotlib",
+    "imageio",
+    "tqdm",
+    "requests",
+    "onnxruntime",
+    "viser==0.2.23",
+    "huggingface_hub",
+    "evo",
+    # requirements.txt (training / misc)
+    "mmengine",
+    "transformers",
+    "accelerate",
+    "wandb",
+    "diffusers",
+    "joblib",
+    "decord",
+    "iopath",
+    "tensorboard",
+    "gradio==5.17.1",
+    "hydra-core",
+    "omegaconf",
+    "pydantic==2.10.6",
+]
+
+[tool.uv]
+# Scripts are run from the repository root (inference.py / train_omnivggt.py import omnivggt and visual_util
+# from the working tree), so the project itself is not built or installed.
+package = false
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+torchvision = [{ index = "pytorch-cu128" }]
+torchaudio = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "tools"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "RUF"]

@@ -2,6 +2,7 @@ from .arkitscenes_high import ARKitScenesHigh
 from .bedlam import Bedlam
 from .blendedmvs import BlendedMVS
 from .co3d import Co3d
+from .colmap_rgbd import ColmapRgbd
 from .dl3dv import Dl3dv
 from .dynamic_replica import Dynamic_Replica
 from .hypersim import Hypersim

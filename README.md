@@ -47,6 +47,14 @@ pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https
 pip install -r requirements.txt
 ```
 
+Alternatively, with [uv](https://docs.astral.sh/uv/) (same pins, torch from the cu128 index; Linux x86_64):
+
+```bash
+uv sync --locked          # creates .venv from pyproject.toml / uv.lock
+uv run pytest -q          # unit tests (dev group)
+uv run python inference.py --image_folder example/office/images/
+```
+
 
 ## 🚀 Quick Start
 
@@ -327,6 +335,24 @@ python train_omnivggt.py --config configs/train.py
 #### Multi-GPU Training (One Node 8x GPUs)
 ```bash
 accelerate launch --num_processes=8 train_omnivggt.py --config configs/train.py
+```
+
+### Fine-tuning on your own RGB-D sequences (`colmap_rgbd_v1`)
+
+`omnivggt.datasets.ColmapRgbd` loads `colmap_rgbd_v1` staging sets (RGB, metric depth in
+millimetres, OpenCV world-to-camera poses, train/val/smoke splits separated by guard frames).
+[tools/rgbd_pose_pipeline](tools/rgbd_pose_pipeline/README.md) describes how to obtain verified
+metric poses for an RGB-D sequence and export such a set. `configs/train_colmap_rgbd.py`
+fine-tunes from the released weights; paths are passed as environment variables:
+
+```bash
+export OMNIVGGT_COLMAP_RGBD_ROOTS=/path/staging_a,/path/staging_b
+export OMNIVGGT_INIT_CHECKPOINT=checkpoints/OmniVGGT.safetensors
+export OMNIVGGT_OUTPUT_DIR=/path/runs
+uv run accelerate launch --num_processes 1 --mixed_precision bf16 \
+  train_omnivggt.py --config configs/train_colmap_rgbd.py
+PYTHONPATH=tools uv run python -m eval_colmap_rgbd --roots /path/staging_a /path/staging_b --split val \
+  --checkpoint /path/runs/omnivggt-colmap-rgbd/final_checkpoint --output eval.json
 ```
 
 ## 📝 To-Do List
