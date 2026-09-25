@@ -1,0 +1,45 @@
+{
+  "name": "omni_reg16",
+  "description": "As omni_reg4, with 16 aggregator registers: the first 4 from OmniVGGT, 12 newly initialised.",
+  "sources": {
+    "omni": {
+      "env": "OMNIVGGT_INIT_OMNI",
+      "format": "safetensors"
+    }
+  },
+  "rules": [
+    {
+      "target_prefix": "aggregator.",
+      "source": "omni",
+      "source_prefix": "aggregator."
+    },
+    {
+      "target_prefix": "camera_head.",
+      "source": "omni",
+      "source_prefix": "camera_head."
+    },
+    {
+      "target_prefix": "depth_head.",
+      "source": "omni",
+      "source_prefix": "depth_head."
+    },
+    {
+      "target_prefix": "aggregator.register_token",
+      "source": "omni",
+      "source_prefix": "aggregator.register_token",
+      "slice": {
+        "dim": 2,
+        "start": 0,
+        "stop": 4
+      }
+    }
+  ],
+  "new": [
+    "aggregator.register_token"
+  ],
+  "drop": {
+    "omni": [
+      "point_head."
+    ]
+  }
+}

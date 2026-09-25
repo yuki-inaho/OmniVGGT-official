@@ -1,0 +1,20 @@
+{
+  "name": "V2",
+  "description": "As V1 with 16 registers (4 from OmniVGGT, 12 new).",
+  "num_register_tokens": 16,
+  "register_attention_layers": [
+    2,
+    6,
+    9,
+    14,
+    20
+  ],
+  "global_rope": true,
+  "cached_layers": [
+    4,
+    11,
+    17,
+    23
+  ],
+  "weight_map": "configs/omnivggt_omega/weight_maps/omni_reg16.json"
+}

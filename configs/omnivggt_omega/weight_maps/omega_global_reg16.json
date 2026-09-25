@@ -1,0 +1,67 @@
+{
+  "name": "omega_global_reg16",
+  "description": "As omni_reg16, but the inter-frame (global) blocks come from VGGT-Omega's inter_frame_blocks (effective qkv bias = bias * bias_mask). VGGT-Omega weights are under the FAIR Noncommercial Research License.",
+  "sources": {
+    "omni": {
+      "env": "OMNIVGGT_INIT_OMNI",
+      "format": "safetensors"
+    },
+    "omega": {
+      "env": "OMNIVGGT_INIT_OMEGA",
+      "format": "torch"
+    }
+  },
+  "rules": [
+    {
+      "target_prefix": "aggregator.",
+      "source": "omni",
+      "source_prefix": "aggregator."
+    },
+    {
+      "target_prefix": "camera_head.",
+      "source": "omni",
+      "source_prefix": "camera_head."
+    },
+    {
+      "target_prefix": "depth_head.",
+      "source": "omni",
+      "source_prefix": "depth_head."
+    },
+    {
+      "target_prefix": "aggregator.register_token",
+      "source": "omni",
+      "source_prefix": "aggregator.register_token",
+      "slice": {
+        "dim": 2,
+        "start": 0,
+        "stop": 4
+      }
+    },
+    {
+      "target_prefix": "aggregator.global_blocks.",
+      "source": "omega",
+      "source_prefix": "aggregator.inter_frame_blocks.",
+      "multiply_by_suffix": {
+        ".attn.qkv.bias": ".attn.qkv.bias_mask"
+      }
+    }
+  ],
+  "new": [
+    "aggregator.register_token"
+  ],
+  "drop": {
+    "omni": [
+      "point_head.",
+      "aggregator.global_blocks."
+    ],
+    "omega": [
+      "aggregator.patch_embed.",
+      "aggregator.frame_blocks.",
+      "aggregator.camera_token",
+      "aggregator.register_token",
+      "aggregator.rope_embed.",
+      "camera_head.",
+      "dense_head."
+    ]
+  }
+}

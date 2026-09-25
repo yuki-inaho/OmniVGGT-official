@@ -180,6 +180,40 @@ def unproject_depth_map_to_point_map(
     return world_points_array
 
 
+def unproject_depth_to_world_points_torch(
+    depth: torch.Tensor, extrinsics: torch.Tensor, intrinsics: torch.Tensor
+) -> torch.Tensor:
+    """Differentiable batched unprojection of z-depth to world points (fp32, autocast disabled).
+
+    Same convention as ``depth_to_world_coords_points``: integer pixel coordinates (u = 0..W-1),
+    OpenCV camera-from-world ``extrinsics``.
+
+    Args:
+        depth: (B, S, H, W, 1) or (B, S, H, W) z-depth.
+        extrinsics: (B, S, 3, 4) camera-from-world matrices.
+        intrinsics: (B, S, 3, 3) pinhole intrinsics without skew.
+
+    Returns:
+        (B, S, H, W, 3) world points.
+    """
+    if depth.ndim == 5:
+        depth = depth[..., 0]
+    with torch.autocast(device_type=depth.device.type, enabled=False):
+        depth, extrinsics, intrinsics = depth.float(), extrinsics.float(), intrinsics.float()
+        height, width = depth.shape[-2:]
+        v, u = torch.meshgrid(
+            torch.arange(height, device=depth.device, dtype=depth.dtype),
+            torch.arange(width, device=depth.device, dtype=depth.dtype),
+            indexing="ij",
+        )
+        fx, fy = intrinsics[..., 0, 0, None, None], intrinsics[..., 1, 1, None, None]
+        cx, cy = intrinsics[..., 0, 2, None, None], intrinsics[..., 1, 2, None, None]
+        cam_points = torch.stack(((u - cx) * depth / fx, (v - cy) * depth / fy, depth), dim=-1)
+        rotation, translation = extrinsics[..., :3, :3], extrinsics[..., :3, 3]
+        # world = R^T (X_cam - t), applied row-wise: (X_cam - t) @ R
+        return (cam_points - translation[:, :, None, None, :]) @ rotation[:, :, None]
+
+
 def depth_to_world_coords_points(
     depth_map: np.ndarray,
     extrinsic: np.ndarray,

@@ -1,0 +1,20 @@
+{
+  "name": "V3",
+  "description": "As V1 without RoPE in inter-frame blocks (VGGT-Omega).",
+  "num_register_tokens": 4,
+  "register_attention_layers": [
+    2,
+    6,
+    9,
+    14,
+    20
+  ],
+  "global_rope": false,
+  "cached_layers": [
+    4,
+    11,
+    17,
+    23
+  ],
+  "weight_map": "configs/omnivggt_omega/weight_maps/omni_reg4.json"
+}

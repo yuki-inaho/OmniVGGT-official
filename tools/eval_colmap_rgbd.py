@@ -8,12 +8,14 @@ RTA@5, AUC@30) and depth AbsRel / delta<1.25 after one median scale per sample
 (OmniVGGT predicts in a normalised scale).
 
 usage: PYTHONPATH=tools uv run python -m eval_colmap_rgbd --roots R1 [R2 ...] --split val \
-           --checkpoint W.safetensors|ACCELERATE_DIR --output eval.json
+           --checkpoint W.safetensors|ACCELERATE_DIR [--model-config VARIANT.json] --output eval.json
+(``--model-config`` selects an OmniVGGTOmega variant; without it the model is OmniVGGT.)
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import time
@@ -64,15 +66,53 @@ def depth_metrics(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> dict:
     return {"abs_rel": float(np.mean(np.abs(p - g) / g)), "delta<1.25": float(np.mean(np.maximum(p / g, g / p) < 1.25))}
 
 
-def _load_model(checkpoint: Path, device: str):
-    from safetensors.torch import load_file
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
-    from omnivggt.models.omnivggt import OmniVGGT
+
+def _build_model(model_config):
+    """OmniVGGT, or the OmniVGGTOmega variant described by ``model_config`` (a variant JSON)."""
+    if model_config is None:
+        from omnivggt.models import omnivggt
+
+        return omnivggt.OmniVGGT()
+    from omnivggt.models.omnivggt_omega import OmniVGGTOmega
+
+    return OmniVGGTOmega.from_variant(model_config)
+
+
+def _model_config_record(model_config):
+    if model_config is None:
+        return None
+    path = Path(model_config)
+    return {"path": str(path), "sha256": _sha256(path), "variant": json.loads(path.read_text())}
+
+
+def _check_variant_provenance(model_config, checkpoint: Path):
+    """For a training run checkpoint (<output_dir>/<exp>/<checkpoint>/), require that ``model_config`` is the
+    variant the run was trained with (recorded in <output_dir>/weight_transfer_report.json)."""
+    if model_config is None:
+        return None
+    report = Path(checkpoint).parent.parent / "weight_transfer_report.json"
+    if not Path(checkpoint).is_dir() or not report.is_file():
+        return "unverified"
+    trained = json.loads(report.read_text())["variant"]["sha256"]
+    if trained != _sha256(Path(model_config)):
+        raise ValueError(f"variant {model_config} is not the one this run was trained with ({report})")
+    return "verified"
+
+
+def _load_model(checkpoint: Path, device: str, model_config=None):
+    from safetensors.torch import load_file
 
     path = checkpoint / "model.safetensors" if checkpoint.is_dir() else checkpoint
     if not path.is_file():
         raise FileNotFoundError(path)
-    model = OmniVGGT()
+    model = _build_model(model_config)
     model.load_state_dict(load_file(str(path)), strict=True)
     return model.to(device).eval(), path
 
@@ -82,6 +122,7 @@ def main() -> int:
     parser.add_argument("--roots", nargs="+", required=True)
     parser.add_argument("--split", default="val")
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--model-config", type=Path, help="OmniVGGTOmega variant JSON (default: OmniVGGT)")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--num-samples", type=int, default=16)
     parser.add_argument("--frames", type=int, default=8)
@@ -114,7 +155,8 @@ def main() -> int:
         if i + span < len(dataset) and dataset.scene_labels[i + span] == dataset.scene_labels[i]
     ]
     anchors = [valid[k] for k in np.linspace(0, len(valid) - 1, args.num_samples).round().astype(int)]
-    model, weights = _load_model(args.checkpoint, "cuda")
+    variant_provenance = _check_variant_provenance(args.model_config, args.checkpoint)
+    model, weights = _load_model(args.checkpoint, "cuda", args.model_config)
 
     samples = []
     start = time.time()
@@ -149,6 +191,9 @@ def main() -> int:
     }
     output = {
         "weights": weights.name,
+        "weights_record": {"path": str(weights.resolve()), "sha256": _sha256(weights)},
+        "model_config": _model_config_record(args.model_config),
+        "variant_provenance": variant_provenance,
         "split": args.split,
         "roots": [Path(r).name for r in args.roots],
         "frames": args.frames,

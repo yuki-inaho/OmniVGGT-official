@@ -12,8 +12,10 @@ License: MIT
 """
 
 import os
+import json
 import math
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -30,6 +32,8 @@ from accelerate.logging import get_logger
 
 from omnivggt.loss import MultitaskLoss
 from omnivggt.models.omnivggt import OmniVGGT
+from omnivggt.models.omnivggt_omega import OmniVGGTOmega
+from omnivggt.utils import weight_transfer
 from omnivggt.datasets import get_data_loader
 
 logger = get_logger(__name__, log_level="INFO")
@@ -172,13 +176,68 @@ def setup_tensorboard(cfg: Any, save_dir: str) -> Optional[SummaryWriter]:
     return None
 
 
+_repo_path = weight_transfer.repo_path
+
+
+def resume_position(checkpoint_name: str, steps_per_epoch: int) -> Tuple[int, int]:
+    """(epoch, global_step) encoded in a checkpoint directory name written by train_omnivggt.py:
+    ``checkpoint-epoch-N`` (end of epoch N) or ``checkpoint-E-S`` (epoch E, step S)."""
+    if checkpoint_name.startswith("checkpoint-epoch-"):
+        epoch = int(checkpoint_name[len("checkpoint-epoch-"):])
+        return epoch, epoch * steps_per_epoch
+    parts = checkpoint_name[len("checkpoint-"):].split("-") if checkpoint_name.startswith("checkpoint-") else []
+    if len(parts) == 2 and all(part.isdigit() for part in parts):
+        return int(parts[0]), int(parts[1])
+    raise ValueError(f"cannot infer epoch/step from checkpoint name {checkpoint_name!r}; "
+                     "resume from checkpoint-epoch-N or checkpoint-E-S")
+
+
+def build_model(cfg: Any) -> torch.nn.Module:
+    """Instantiate the model named by ``cfg.model_name`` ("omnivggt" by default, or "omnivggt_omega")."""
+    name = cfg.get("model_name", "omnivggt")
+    if name == "omnivggt":
+        return OmniVGGT(enable_point=cfg.get("enable_point", True),
+                        enable_depth=cfg.get("enable_depth", True),
+                        cam_drop_prob=cfg.get("cam_drop_prob", 0.1),
+                        depth_drop_prob=cfg.get("depth_drop_prob", 0.1))
+    if name == "omnivggt_omega":
+        if cfg.get("init_checkpoint"):
+            raise ValueError("omnivggt_omega is initialised from its variant's weight map; do not set init_checkpoint")
+        variant = cfg.get("omega_variant")
+        if not variant:
+            raise ValueError("model_name=omnivggt_omega needs omega_variant (a variant JSON)")
+        torch.manual_seed(cfg.get("seed", weight_transfer.DEFAULT_SEED))  # initial values of parameters declared new
+        return OmniVGGTOmega.from_variant(_repo_path(variant),
+                                          cam_drop_prob=cfg.get("cam_drop_prob", 0.1),
+                                          depth_drop_prob=cfg.get("depth_drop_prob", 0.1))
+    raise ValueError(f"unknown model_name {name!r}")
+
+
+def load_variant_weights(model: torch.nn.Module, cfg: Any) -> str:
+    """Non-strict, audited load of an OmniVGGTOmega variant from the checkpoints its weight map names."""
+    variant_path = _repo_path(cfg.get("omega_variant"))
+    variant = json.loads(variant_path.read_text())
+    weight_map = weight_transfer.load_map(weight_transfer.variant_map_path(variant_path))
+    sources, files = weight_transfer.load_sources(weight_map)
+    report = weight_transfer.transfer_weights(model, weight_map, sources, files=files)
+    report["variant"] = {"file": variant_path.name, "sha256": weight_transfer.sha256_of(variant_path),
+                         "seed": cfg.get("seed", 42), "content": variant}
+    output_dir = Path(cfg.get("output_dir", "outputs"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "weight_transfer_report.json").write_text(json.dumps(report, indent=1) + "\n")
+    return f"weight_map:{weight_map['name']} (variant {variant_path.name})"
+
+
 def load_initial_weights(model: torch.nn.Module, cfg: Any) -> str:
     """Load the starting weights.
 
     ``init_checkpoint`` (a local ``.safetensors`` file, e.g. the released OmniVGGT
     weights) is loaded strictly and must exist; otherwise the original
-    ``model_url`` behaviour (VGGT-1B from the hub) is used.
+    ``model_url`` behaviour (VGGT-1B from the hub) is used. OmniVGGTOmega variants
+    are loaded through their weight map instead.
     """
+    if cfg.get("model_name", "omnivggt") == "omnivggt_omega":
+        return load_variant_weights(model, cfg)
     init_checkpoint = cfg.get("init_checkpoint")
     if init_checkpoint:
         path = Path(init_checkpoint)
@@ -211,11 +270,9 @@ def load_model(cfg: Any, device: torch.device) -> Tuple[OmniVGGT, torch.dtype]:
     Returns:
         Tuple of (model, weight_dtype)
     """
-    logger.info("Initializing OmniVGGT model...")
-    model = OmniVGGT(enable_point=cfg.get("enable_point", True),
-                     enable_depth=cfg.get("enable_depth", True),
-                     cam_drop_prob=cfg.get("cam_drop_prob", 0.1),
-                     depth_drop_prob=cfg.get("depth_drop_prob", 0.1))
+    logger.info(f"Initializing {cfg.get('model_name', 'omnivggt')} model...")
+    model = build_model(cfg)
+    logger.info(f"cam_drop_prob={model.aggregator.cam_drop_prob} depth_drop_prob={model.aggregator.depth_drop_prob}")
 
     # Print network parameters and their indices
     # logger.info("Network parameters and their indices:")
@@ -236,6 +293,108 @@ def load_model(cfg: Any, device: torch.device) -> Tuple[OmniVGGT, torch.dtype]:
     return model, weight_dtype
 
 
+# AMUSE: Muon (orthogonalised momentum) for hidden-layer weight matrices, AdamW-style updates for the rest.
+AMUSE_FALLBACK_WEIGHT_MODULES = (
+    "aggregator.pose_embeddings.",  # input embeddings of the auxiliary camera
+    "aggregator.depth_patch_embed.proj",  # input embedding of the auxiliary depth
+    "camera_head.embed_pose",  # input embedding of the pose being refined
+    "camera_head.pose_branch.fc2",  # output layer (pose encoding)
+    "depth_head.scratch.output_conv2.2",  # output layer (depth and confidence)
+)
+_MATRIX_MODULES = (torch.nn.Linear, torch.nn.Conv2d, torch.nn.ConvTranspose2d)
+
+
+def classify_amuse_parameters(model: torch.nn.Module) -> Tuple[list, list]:
+    """Split the trainable parameters into (Muon names, AdamW-fallback names); every one appears exactly once."""
+    matrices = {
+        f"{name}.weight"
+        for name, module in model.named_modules()
+        if isinstance(module, _MATRIX_MODULES) and not name.startswith(AMUSE_FALLBACK_WEIGHT_MODULES)
+    }
+    muon, fallback = [], []
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            (muon if name in matrices else fallback).append(name)
+    if not muon or not fallback:
+        raise ValueError(f"AMUSE needs both groups non-empty (muon={len(muon)}, fallback={len(fallback)})")
+    return sorted(muon), sorted(fallback)
+
+
+def _amuse_warmup_steps(cfg: Any, total_steps: int) -> int:
+    return max(1, math.ceil(cfg.get("amuse_warmup_ratio", 0.05) * total_steps))
+
+
+def _build_amuse(model: torch.nn.Module, cfg: Any) -> torch.optim.Optimizer:
+    from omnivggt.optim.amuse import AMUSE
+
+    if cfg.get("patch_embed_freeze", False):
+        model.aggregator.patch_embed.requires_grad_(False)
+        logger.info("patch_embed parameters are frozen.")
+    for head in ("camera_head", "depth_head"):
+        if cfg.get(f"{head}_freeze", False):
+            getattr(model, head).requires_grad_(False)
+    if cfg.get("enable_point", False) and getattr(model, "point_head", None) is None:
+        raise ValueError("enable_point=True but the model has no point_head (use point_loss_mode='derived')")
+    muon_names, fallback_names = classify_amuse_parameters(model)
+    parameters = dict(model.named_parameters())
+    weight_decay = cfg.get("amuse_weight_decay", 0.01)
+    groups = [
+        {"params": [parameters[n] for n in muon_names], "use_muon": True, "lr": cfg.get("amuse_muon_lr", 1e-4),
+         "momentum": cfg.get("amuse_momentum", 0.95), "aux_update_type": "adamw", "weight_decay": weight_decay,
+         "name": "amuse_muon"},
+        {"params": [parameters[n] for n in fallback_names], "use_muon": False, "lr": cfg.get("amuse_aux_lr", 1e-5),
+         "beta2": cfg.get("amuse_beta2", 0.999), "weight_decay": weight_decay, "name": "amuse_fallback"},
+    ]
+    estimated_steps = cfg.get("num_train_epochs", 1) * cfg.get("steps_per_epoch", 1) // cfg.get("gradient_accumulation_steps", 1)
+    optimizer = AMUSE(
+        groups,
+        weight_decay_at_y=cfg.get("amuse_weight_decay_at_y", 0.0),
+        beta1=cfg.get("amuse_beta1", 0.4),
+        weight_lr_power=cfg.get("amuse_weight_lr_power", 2.0),
+        warmup_steps=_amuse_warmup_steps(cfg, max(1, estimated_steps)),
+        rho=cfg.get("amuse_rho", 0.3),
+        r=cfg.get("amuse_r", 0.0),
+    )
+    logger.info(f"Optimizer created: AMUSE (muon={len(muon_names)} tensors, fallback={len(fallback_names)} tensors)")
+    return optimizer
+
+
+def configure_schedule(optimizer: torch.optim.Optimizer, cfg: Any, total_steps: int):
+    """LR schedule for the run: AMUSE is schedule-free (only its warm-up length is set, returns None);
+    other optimizers get the cosine warm-up scheduler."""
+    inner = getattr(optimizer, "optimizer", optimizer)
+    if hasattr(inner, "train_mode"):  # AMUSE (Schedule-Free family)
+        warmup = _amuse_warmup_steps(cfg, total_steps)
+        inner.warmup_steps = warmup
+        for group in inner.param_groups:
+            group["warmup_steps"] = warmup
+        logger.info(f"AMUSE warm-up: {warmup} of {total_steps} steps; no external LR scheduler")
+        return None
+    return build_cosine_warmup_scheduler(
+        optimizer=optimizer,
+        warmup_steps=cfg.get("warmup_steps", 5000),
+        total_steps=total_steps,
+        eta_min_factor=cfg.get("eta_min_factor", 0.1),
+    )
+
+
+@contextmanager
+def evaluation_weights(optimizer: torch.optim.Optimizer):
+    """Expose the evaluation weights while the block runs (AMUSE: averaged x instead of the gradient point y),
+    e.g. around checkpoint saving; restores the training state afterwards. No-op for other optimizers."""
+    inner = getattr(optimizer, "optimizer", optimizer)
+    if not hasattr(inner, "train_mode"):
+        yield
+        return
+    was_training = inner.train_mode
+    optimizer.eval()
+    try:
+        yield
+    finally:
+        if was_training:
+            optimizer.train()
+
+
 def build_optimizer(model: torch.nn.Module, cfg: Any) -> torch.optim.Optimizer:
     """
     Build optimizer with parameter groups for different learning rates.
@@ -247,6 +406,8 @@ def build_optimizer(model: torch.nn.Module, cfg: Any) -> torch.optim.Optimizer:
     Returns:
         Optimizer instance
     """
+    if cfg.get("optimizer_type", "adamw").lower() == "amuse":
+        return _build_amuse(model, cfg)
     param_groups = []
     exclude_keys = ["aggregator.patch_embed"]
     
@@ -291,6 +452,8 @@ def build_optimizer(model: torch.nn.Module, cfg: Any) -> torch.optim.Optimizer:
             logger.info(f"depth_head lr set to {cfg.get('lr_depth_head', cfg.get('lr'))}")
             
     if cfg.get("enable_point", False):
+        if getattr(model, "point_head", None) is None:
+            raise ValueError("enable_point=True but the model has no point_head (use point_loss_mode='derived')")
         exclude_keys.append("point_head")
         if cfg.get("point_head_freeze", False):
             for param in model.point_head.parameters():
@@ -331,6 +494,15 @@ def build_optimizer(model: torch.nn.Module, cfg: Any) -> torch.optim.Optimizer:
     return optimizer
 
 
+def _point_loss_config(cfg: Any) -> dict:
+    if cfg.get("point_loss_mode", "head") == "derived":
+        return {"mode": "derived", "weight": cfg.get("point_loss_weight", 1.0),
+                "intrinsics_warmup_ratio": cfg.get("point_intrinsics_warmup_ratio", 0.5)}
+    return {"weight": cfg.get("point_loss_weight", 1.0),
+            "gradient_loss_fn": cfg.get("point_gradient_loss_fn", "normal"),
+            "valid_range": cfg.get("point_valid_range", 0.98)}
+
+
 def build_loss_criterion(cfg: Any) -> MultitaskLoss:
     """
     Build multi-task loss criterion.
@@ -351,11 +523,7 @@ def build_loss_criterion(cfg: Any) -> MultitaskLoss:
             "gradient_loss_fn": cfg.get("depth_gradient_loss_fn", "grad"),
             "valid_range": cfg.get("depth_valid_range", 0.98)
         },
-        point={
-            "weight": cfg.get("point_loss_weight", 1.0),
-            "gradient_loss_fn": cfg.get("point_gradient_loss_fn", "normal"),
-            "valid_range": cfg.get("point_valid_range", 0.98)
-        }
+        point=_point_loss_config(cfg),
     )
     
     logger.info("Loss criterion initialized:")

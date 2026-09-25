@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 
 from dataclasses import dataclass
-from omnivggt.utils.pose_enc import extri_intri_to_pose_encoding
+from omnivggt.utils.geometry import unproject_depth_to_world_points_torch
+from omnivggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
 from omnivggt.utils.general import check_and_fix_inf_nan
 from math import ceil, floor
 
@@ -32,7 +33,7 @@ class MultitaskLoss(torch.nn.Module):
         self.point = point
         self.track = track
 
-    def forward(self, predictions, batch) -> torch.Tensor:
+    def forward(self, predictions, batch, progress=None) -> torch.Tensor:
         """
         Compute the total multi-task loss.
         
@@ -61,8 +62,17 @@ class MultitaskLoss(torch.nn.Module):
             total_loss = total_loss + depth_loss
             loss_dict.update(depth_loss_dict)
 
+        # 3D point loss on points unprojected from the predicted depth and camera (no point head)
+        if self.point is not None and self.point.get("mode", "head") == "derived":
+            if progress is None:
+                raise ValueError("the derived point loss needs the training progress in [0, 1]")
+            options = {key: value for key, value in self.point.items() if key not in ("mode", "weight")}
+            point_loss_dict = compute_derived_point_loss(predictions, batch, progress, **options)
+            total_loss = total_loss + point_loss_dict["loss_point"] * self.point["weight"]
+            loss_dict.update(point_loss_dict)
+
         # 3D point reconstruction loss - if world points are predicted
-        if "world_points" in predictions and self.point is not None:
+        elif "world_points" in predictions and self.point is not None:
             point_loss_dict = compute_point_loss(predictions, batch, **self.point)
             point_loss = point_loss_dict["loss_conf_point"] + point_loss_dict["loss_reg_point"] + point_loss_dict["loss_grad_point"]
             point_loss = point_loss * self.point["weight"]
@@ -72,6 +82,60 @@ class MultitaskLoss(torch.nn.Module):
         loss_dict["objective"] = total_loss
 
         return loss_dict
+
+
+def relative_depth_weights(depth, mask, floor_ratio=0.1, clip=(0.1, 10.0)):
+    """Per-pixel weight 1 / max(D, floor_ratio * mean valid D of the frame), clipped to ``clip``."""
+    valid = mask.to(depth.dtype)
+    frame_mean = (depth * valid).sum(dim=(-2, -1), keepdim=True) / valid.sum(dim=(-2, -1), keepdim=True).clamp(min=1)
+    return (1.0 / (torch.maximum(depth, floor_ratio * frame_mean) + 1e-6)).clamp(*clip)
+
+
+def compute_derived_point_loss(
+    predictions,
+    batch,
+    progress,
+    intrinsics_warmup_ratio=0.5,
+    rel_weight=1.0,
+    abs_weight=0.0,
+    max_pixel_loss=100.0,
+    min_valid_pts=1000,
+):
+    """L1 loss on world points unprojected from the predicted depth and final camera (VGGT-Omega, Sec. 3.2).
+
+    Points are built from ``predictions["depth"]`` and the last entry of ``predictions["pose_enc_list"]``.
+    During the first ``intrinsics_warmup_ratio`` of training the ground-truth intrinsics are used; afterwards
+    the predicted focal lengths with the ground-truth principal point (a pose encoding has none).
+    The per-pixel error is weighted by ``rel_weight * relative_depth_weights + abs_weight`` and capped at
+    ``max_pixel_loss``. Ground truth: normalised ``world_points``, ``depth``, ``intrinsic`` and ``valid_mask``.
+    """
+    depth = predictions["depth"]
+    pose_enc = predictions["pose_enc_list"][-1]
+    height, width = depth.shape[2:4]
+    extrinsics, intrinsics = pose_encoding_to_extri_intri(pose_enc, (height, width))
+    gt_intrinsics = batch["intrinsic"].to(intrinsics.dtype)
+    if progress < intrinsics_warmup_ratio:
+        intrinsics = gt_intrinsics
+    else:
+        intrinsics = intrinsics.clone()
+        intrinsics[..., :2, 2] = gt_intrinsics[..., :2, 2]
+    points = unproject_depth_to_world_points_torch(depth, extrinsics, intrinsics)
+    gt_points = batch["world_points"].float()
+    mask = batch["valid_mask"].bool()
+    gt_depth = batch["depth"].float()
+    if gt_depth.ndim == 5:
+        gt_depth = gt_depth[..., 0]
+
+    error = (points - gt_points).abs()
+    weights = rel_weight * relative_depth_weights(gt_depth, mask) + abs_weight
+    weighted = (error * weights[..., None])[mask].clamp(max=max_pixel_loss)
+    if mask.sum() > min_valid_pts:
+        loss = weighted.mean()
+        unweighted = error[mask].mean().detach()
+    else:
+        loss = points.sum() * 0.0
+        unweighted = loss.detach()
+    return {"loss_point": loss, "point_l1_unweighted": unweighted}
 
 
 def compute_camera_loss(

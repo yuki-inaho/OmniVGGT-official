@@ -71,6 +71,8 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
+# vendored third-party source kept byte-identical to upstream (see omnivggt/optim/UPSTREAM.md)
+extend-exclude = ["omnivggt/optim/amuse.py"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B", "RUF"]

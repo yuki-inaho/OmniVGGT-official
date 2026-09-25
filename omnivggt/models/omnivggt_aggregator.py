@@ -84,6 +84,10 @@ class ZeroAggregator(Aggregator):
                                             in_chans=2,
                                             embed_dim=embed_dim)
         
+    def _collect_layer(self, layer_idx, frame_out, global_out):
+        """Output of one alternating-attention layer for the heads: concat frame and global tokens, [B x S x P x 2C]."""
+        return torch.cat([frame_out, global_out], dim=-1)
+
     def _match_dtype(self, x, reference):
         return x.to(dtype=reference.dtype, device=reference.device)
     
@@ -281,11 +285,8 @@ class ZeroAggregator(Aggregator):
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
             for i in range(len(frame_intermediates)):
-                # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+                output_list.append(self._collect_layer(len(output_list), frame_intermediates[i], global_intermediates[i]))
 
-        del concat_inter
         del frame_intermediates
         del global_intermediates
         return output_list, self.patch_start_idx
@@ -410,11 +411,8 @@ class ZeroAggregator(Aggregator):
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
             for i in range(len(frame_intermediates)):
-                # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
-                output_list.append(concat_inter)
+                output_list.append(self._collect_layer(len(output_list), frame_intermediates[i], global_intermediates[i]))
 
-        del concat_inter
         del frame_intermediates
         del global_intermediates
         return output_list, self.patch_start_idx

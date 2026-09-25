@@ -24,7 +24,8 @@ from visual_util import (
 )
 from train_utils import (
     build_dataset,
-    build_cosine_warmup_scheduler,
+    configure_schedule,
+    evaluation_weights,
     setup_logging,
     setup_directories,
     setup_wandb,
@@ -32,6 +33,7 @@ from train_utils import (
     load_model,
     build_optimizer,
     build_loss_criterion,
+    resume_position,
 )
 
 logger = get_logger(__name__, log_level="INFO")
@@ -123,13 +125,9 @@ if __name__ == '__main__':
     logger.info(f"  Steps per epoch (per process): {local_steps_per_epoch}")
     logger.info(f"  Total training steps: {total_training_steps}")
     
-    lr_scheduler = build_cosine_warmup_scheduler(
-        optimizer=optimizer,
-        warmup_steps=cfg.get("warmup_steps", 5000),
-        total_steps=total_training_steps,
-        eta_min_factor=cfg.get("eta_min_factor", 0.1)
-    )
-    accelerator.register_for_checkpointing(lr_scheduler)
+    lr_scheduler = configure_schedule(optimizer, cfg, total_training_steps)  # None for schedule-free AMUSE
+    if lr_scheduler is not None:
+        accelerator.register_for_checkpointing(lr_scheduler)
     
     # ======================================================
     # 5. Resume from Checkpoint (if specified)
@@ -149,16 +147,10 @@ if __name__ == '__main__':
             else:
                 checkpoint_name = os.path.basename(os.path.dirname(checkpoint_dir))
             
-            if checkpoint_name.startswith('checkpoint-'):
-                parts = checkpoint_name.replace('checkpoint-', '').split('-')
-                initial_epoch = int(parts[0])
-                initial_step = int(parts[1])
-                logger.info(f"Resumed at epoch {initial_epoch}, step {initial_step}")
-            else:
-                logger.warning(f"Checkpoint name does not match expected format: {checkpoint_name}")
+            initial_epoch, initial_step = resume_position(checkpoint_name, local_steps_per_epoch)
+            logger.info(f"Resumed at epoch {initial_epoch}, step {initial_step}")
         else:
-            logger.warning(f"Resume path does not exist: {resume_path}")
-            logger.warning("Starting training from scratch...")
+            raise FileNotFoundError(f"resume_model_path does not exist: {resume_path}")
     
     # ======================================================
     # 6. Training Information
@@ -186,6 +178,7 @@ if __name__ == '__main__':
     # 7. Training Loop
     # ======================================================
     global_step = initial_step
+    optimizer.train()  # AMUSE computes gradients at y; no-op for AdamW
     accumulation_steps = cfg.get("gradient_accumulation_steps", 2)
     
     for epoch in range(initial_epoch, cfg.get('num_train_epochs')):
@@ -254,7 +247,7 @@ if __name__ == '__main__':
             # Compute loss
             loss_details = {}
             with torch.amp.autocast('cuda', enabled=False):
-                loss_dict = train_criterion(predictions, batch)
+                loss_dict = train_criterion(predictions, batch, progress=global_step / max(total_training_steps, 1))
                 for key, value in loss_dict.items():
                     if isinstance(value, torch.Tensor):
                         loss_details[key] = value.detach().item()
@@ -270,7 +263,8 @@ if __name__ == '__main__':
                 
                 # Optimizer step
                 optimizer.step()
-                lr_scheduler.step()
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
                 optimizer.zero_grad()
                 
                 progress_bar.update(1)
@@ -334,7 +328,8 @@ if __name__ == '__main__':
                     completed_epochs = global_step // local_steps_per_epoch
                     save_path = os.path.join(save_dir, f"checkpoint-{completed_epochs}-{global_step}")
                     logger.info(f"Saving checkpoint to {save_path}...")
-                    accelerator.save_state(save_path)
+                    with evaluation_weights(optimizer):  # AMUSE: save the averaged (evaluation) weights
+                        accelerator.save_state(save_path)
                     logger.info(f"Checkpoint saved successfully")
         
         progress_bar.close()
@@ -344,7 +339,8 @@ if __name__ == '__main__':
             logger.info(f"Applying remaining gradients at end of epoch {epoch + 1}")
             accelerator.clip_grad_norm_(model.parameters(), cfg.get('max_grad_norm', 1.0))
             optimizer.step()
-            lr_scheduler.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
             optimizer.zero_grad()
             global_step += 1
         
@@ -355,7 +351,8 @@ if __name__ == '__main__':
         if accelerator.is_main_process and cfg.get("save_each_epoch", True):
             epoch_save_path = os.path.join(save_dir, f"checkpoint-epoch-{epoch + 1}")
             logger.info(f"Saving end-of-epoch checkpoint to {epoch_save_path}...")
-            accelerator.save_state(epoch_save_path)
+            with evaluation_weights(optimizer):  # AMUSE: save the averaged (evaluation) weights
+                accelerator.save_state(epoch_save_path)
         
         gc.collect()
         torch.cuda.empty_cache()
@@ -368,7 +365,8 @@ if __name__ == '__main__':
     if accelerator.is_main_process:
         final_save_path = os.path.join(save_dir, "final_checkpoint")
         logger.info(f"Saving final checkpoint to {final_save_path}...")
-        accelerator.save_state(final_save_path)
+        with evaluation_weights(optimizer):  # AMUSE: save the averaged (evaluation) weights
+            accelerator.save_state(final_save_path)
         logger.info("Final checkpoint saved successfully")
         
         if cfg.get("wandb", False):

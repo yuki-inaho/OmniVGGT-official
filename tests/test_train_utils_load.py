@@ -31,3 +31,113 @@ def test_mismatched_keys_raise(tmp_path):
     save_file({"other.weight": torch.zeros(2, 3)}, tmp_path / "bad.safetensors")
     with pytest.raises(RuntimeError):
         load_initial_weights(Tiny(), {"init_checkpoint": str(tmp_path / "bad.safetensors")})
+
+
+# --- OmniVGGTOmega training path -------------------------------------------------------------
+
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from accelerate import PartialState  # noqa: E402
+
+import train_utils  # noqa: E402
+from omnivggt.models.omnivggt_omega import OmniVGGTOmega  # noqa: E402
+
+TINY_OMEGA = dict(
+    img_size=28,
+    patch_size=14,
+    embed_dim=32,
+    num_register_tokens=4,
+    register_attention_layers=(1,),
+    global_rope=False,
+    cached_layers=(0, 1, 2, 3),
+    aggregator_kwargs=dict(depth=4, num_heads=2, patch_embed="conv"),
+    camera_head_kwargs=dict(trunk_depth=1, num_heads=2),
+    depth_head_kwargs=dict(features=16, out_channels=[8, 16, 32, 32], intermediate_layer_idx=[0, 1, 2, 3]),
+)
+
+
+@pytest.fixture
+def omega_cfg(tmp_path, monkeypatch):
+    PartialState()  # train_utils logs through accelerate
+    torch.manual_seed(3)
+    source = OmniVGGTOmega(**TINY_OMEGA)
+    weights = tmp_path / "source.safetensors"
+    save_file({k: v.contiguous() for k, v in source.state_dict().items()}, weights)
+    weight_map = tmp_path / "map.json"
+    weight_map.write_text(json.dumps({
+        "name": "tiny", "sources": {"omni": {"env": "TEST_INIT_OMNI", "format": "safetensors"}},
+        "rules": [{"target_prefix": "", "source": "omni", "source_prefix": ""}], "new": [], "drop": {},
+    }))
+    variant = tmp_path / "variant.json"
+    variant.write_text(json.dumps({"name": "tiny", "weight_map": str(weight_map)}))
+    monkeypatch.setenv("TEST_INIT_OMNI", str(weights))
+    built = {}
+
+    def fake_from_variant(path, **kwargs):
+        built.update(kwargs, path=path)
+        return OmniVGGTOmega(**{**TINY_OMEGA, **kwargs})
+
+    monkeypatch.setattr(OmniVGGTOmega, "from_variant", staticmethod(fake_from_variant))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+    cfg = {"model_name": "omnivggt_omega", "omega_variant": str(variant), "cam_drop_prob": 0.1,
+           "depth_drop_prob": 0.3, "output_dir": str(tmp_path / "run"), "seed": 42}
+    return cfg, source, built
+
+
+def test_load_model_omega_variant(omega_cfg):
+    cfg, source, built = omega_cfg
+    model, _ = train_utils.load_model(cfg, torch.device("cpu"))
+    assert built["cam_drop_prob"] == 0.1 and built["depth_drop_prob"] == 0.3
+    assert model.aggregator.depth_drop_prob == 0.3 and model.aggregator.cam_drop_prob == 0.1
+    for key, value in source.state_dict().items():
+        assert torch.equal(model.state_dict()[key], value)
+    report = json.loads(Path(cfg["output_dir"], "weight_transfer_report.json").read_text())
+    assert report["variant"]["seed"] == 42 and len(report["variant"]["sha256"]) == 64
+    assert report["targets"]["new"]["keys"] == 0
+
+
+def test_init_checkpoint_and_variant_are_exclusive(omega_cfg):
+    cfg, _, _ = omega_cfg
+    with pytest.raises(ValueError, match="init_checkpoint"):
+        train_utils.load_model({**cfg, "init_checkpoint": "w.safetensors"}, torch.device("cpu"))
+
+
+def test_unknown_model_name_raises(omega_cfg):
+    cfg, _, _ = omega_cfg
+    with pytest.raises(ValueError, match="model_name"):
+        train_utils.load_model({**cfg, "model_name": "nope"}, torch.device("cpu"))
+
+
+def test_build_loss_criterion_derived_mode():
+    PartialState()
+    derived = train_utils.build_loss_criterion(
+        {"point_loss_mode": "derived", "point_loss_weight": 1.0, "point_intrinsics_warmup_ratio": 0.5}
+    )
+    assert derived.point == {"mode": "derived", "weight": 1.0, "intrinsics_warmup_ratio": 0.5}
+    head = train_utils.build_loss_criterion({})
+    assert head.point == {"weight": 1.0, "gradient_loss_fn": "normal", "valid_range": 0.98}
+
+
+def test_build_optimizer_point_head_mismatch_raises():
+    PartialState()
+    model = OmniVGGTOmega(**TINY_OMEGA)
+    base = {"lr": 1e-5, "enable_camera": True, "enable_depth": True}
+    with pytest.raises(ValueError, match="point_head"):
+        train_utils.build_optimizer(model, {**base, "enable_point": True})
+    optimizer = train_utils.build_optimizer(model, {**base, "enable_point": False})
+    grouped = [id(p) for group in optimizer.param_groups for p in group["params"]]
+    assert len(grouped) == len(set(grouped)) == sum(1 for _ in model.parameters())
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [("checkpoint-epoch-1", (1, 1560)), ("checkpoint-epoch-2", (2, 3120)), ("checkpoint-0-500", (0, 500))],
+)
+def test_resume_position(name, expected):
+    assert train_utils.resume_position(name, steps_per_epoch=1560) == expected
+
+
+def test_resume_position_rejects_unknown_names():
+    with pytest.raises(ValueError, match="final_checkpoint"):
+        train_utils.resume_position("final_checkpoint", steps_per_epoch=1560)

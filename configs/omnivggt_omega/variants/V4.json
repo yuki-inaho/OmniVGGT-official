@@ -1,0 +1,20 @@
+{
+  "name": "V4",
+  "description": "VGGT-Omega inter-frame attention (16 registers, register attention, no RoPE); weights from OmniVGGT.",
+  "num_register_tokens": 16,
+  "register_attention_layers": [
+    2,
+    6,
+    9,
+    14,
+    20
+  ],
+  "global_rope": false,
+  "cached_layers": [
+    4,
+    11,
+    17,
+    23
+  ],
+  "weight_map": "configs/omnivggt_omega/weight_maps/omni_reg16.json"
+}

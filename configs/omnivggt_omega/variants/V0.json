@@ -1,0 +1,14 @@
+{
+  "name": "V0",
+  "description": "Reference: OmniVGGT's inter-frame attention unchanged (only point head removed and head layers cached).",
+  "num_register_tokens": 4,
+  "register_attention_layers": [],
+  "global_rope": true,
+  "cached_layers": [
+    4,
+    11,
+    17,
+    23
+  ],
+  "weight_map": "configs/omnivggt_omega/weight_maps/omni_reg4.json"
+}

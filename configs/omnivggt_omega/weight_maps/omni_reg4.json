@@ -1,0 +1,33 @@
+{
+  "name": "omni_reg4",
+  "description": "Everything from the released OmniVGGT weights; the independent point head is not used.",
+  "sources": {
+    "omni": {
+      "env": "OMNIVGGT_INIT_OMNI",
+      "format": "safetensors"
+    }
+  },
+  "rules": [
+    {
+      "target_prefix": "aggregator.",
+      "source": "omni",
+      "source_prefix": "aggregator."
+    },
+    {
+      "target_prefix": "camera_head.",
+      "source": "omni",
+      "source_prefix": "camera_head."
+    },
+    {
+      "target_prefix": "depth_head.",
+      "source": "omni",
+      "source_prefix": "depth_head."
+    }
+  ],
+  "new": [],
+  "drop": {
+    "omni": [
+      "point_head."
+    ]
+  }
+}
