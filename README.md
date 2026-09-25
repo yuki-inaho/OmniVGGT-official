@@ -355,6 +355,72 @@ PYTHONPATH=tools uv run python -m eval_colmap_rgbd --roots /path/staging_a /path
   --checkpoint /path/runs/omnivggt-colmap-rgbd/final_checkpoint --output eval.json
 ```
 
+### OmniVGGT with VGGT-Ω style inter-frame attention (`OmniVGGTOmega`)
+
+`omnivggt.models.omnivggt_omega.OmniVGGTOmega` keeps OmniVGGT's image encoder, frame attention, GeoAdapter
+(auxiliary camera/depth inputs), iterative camera head and DPT depth head, and changes only the
+inter-frame (global) attention following [VGGT-Ω](https://arxiv.org/abs/2605.15195):
+
+- **register attention**: in 5 of the 24 inter-frame layers (`{2, 6, 9, 14, 20}`) only the camera
+  and register tokens of all frames attend to each other; image tokens skip the whole block;
+- 16 aggregator registers (the image encoder keeps its own 4 DINOv2 registers) and no RoPE in the
+  inter-frame blocks;
+- only the four layers read by the heads (`{4, 11, 17, 23}`) are kept in memory;
+- no separate point head: `world_points` are unprojected from the predicted depth and camera, and the
+  point loss is applied to those points (as in VGGT-Ω, Sec. 3.2).
+
+The register routing and the depth-derived point loss are implemented here from the paper; no
+VGGT-Ω code is included. Variants are described by `configs/omnivggt_omega/variants/*.json`.
+Initial weights are loaded **non-strictly but audited**: a weight map
+(`configs/omnivggt_omega/weight_maps/*.json`) declares the source of every parameter, and
+`omnivggt/utils/weight_transfer.py` reports loaded / renamed / sliced / new / dropped keys and fails
+on anything undeclared. `omega_global_*` maps take the inter-frame blocks from a VGGT-Ω checkpoint
+(effective bias `qkv.bias * qkv.bias_mask`); those weights are released under the FAIR
+Noncommercial Research License.
+
+```bash
+export OMNIVGGT_COLMAP_RGBD_ROOTS=/path/staging_a,/path/staging_b
+export OMNIVGGT_INIT_OMNI=checkpoints/OmniVGGT.safetensors
+export OMNIVGGT_INIT_OMEGA=/path/vggt_omega_1b_416_reproduce.pt   # only for omega_global_* maps
+export OMNIVGGT_OMEGA_VARIANT=configs/omnivggt_omega/variants/V5.json
+export OMNIVGGT_OUTPUT_DIR=/path/runs/omega_V5
+uv run accelerate launch --num_processes 1 --mixed_precision bf16 \
+  train_omnivggt.py --config configs/train_colmap_rgbd_omega.py
+PYTHONPATH=tools uv run python -m eval_colmap_rgbd --model-config $OMNIVGGT_OMEGA_VARIANT \
+  --roots /path/staging_a /path/staging_b --split val \
+  --checkpoint /path/runs/omega_V5/omnivggt-omega-colmap-rgbd/final_checkpoint --output eval.json
+PYTHONPATH=tools uv run python -m compare_eval --baseline eval_omnivggt.json --candidate eval.json \
+  --thresholds configs/omnivggt_omega/equivalence_thresholds.json --output equivalence.json
+PYTHONPATH=tools uv run python -m bench_inference --model-config $OMNIVGGT_OMEGA_VARIANT \
+  --checkpoint /path/runs/omega_V5/omnivggt-omega-colmap-rgbd/final_checkpoint \
+  --width 392 --height 294 --frames 8 16 32 --condition rgb --output bench.json
+```
+
+Training also accepts `OMNIVGGT_OPTIMIZER=amuse` (AMUSE, [kjeiun/amuse](https://github.com/kjeiun/amuse),
+Apache-2.0, vendored unmodified in `omnivggt/optim/`): Muon for hidden-layer weight matrices and
+AdamW-style updates for the rest, schedule-free (warm-up only); checkpoints store its averaged weights.
+
+**Results on our own RGB-D sequences** (variant V5: inter-frame blocks from VGGT-Ω, i.e. FAIR
+Noncommercial weights, everything else from OmniVGGT; two sequences of a rail-mounted RGB-D camera; fine-tuned with
+the same data and recipe as the OmniVGGT baseline: 12 images/step, 3,120 steps, frozen image encoder;
+validation split, 16 samples x 8 frames at 392x294; RTX 5090, bf16):
+
+| | OmniVGGT (fine-tuned) | OmniVGGTOmega V5 |
+| :--- | ---: | ---: |
+| inference latency, 8 / 16 / 32 frames (ms) | 134 / 281 / 668 | 104 / 218 / 522 (**1.28-1.29x faster**) |
+| inference peak activations, 8 / 16 / 32 frames (MiB) | 3746 / 4656 / 6501 | 2990 / 3158 / 3506 |
+| training time per step (s) | 0.771 | 0.613 |
+
+Accuracy was compared against the fine-tuned OmniVGGT with thresholds fixed before training
+(`configs/omnivggt_omega/equivalence_thresholds.json`, `tools/compare_eval.py`). With the baseline
+recipe 7 of the 24 checks fail. With AMUSE (same number of steps) or twice the steps, all camera-pose
+checks pass (AMUSE exceeds the baseline AUC@30 in every condition, e.g. RGB-only 0.984 vs 0.977) and depth
+with auxiliary depth input is better than the baseline, but **depth without auxiliary depth input stays worse** (AbsRel 0.065-0.077 vs 0.056 depending
+on the recipe; closest with twice the steps and an unfrozen image encoder), so the pre-registered
+equivalence test was not passed. A control run with the original inter-frame attention but no point head and the depth-derived
+point loss matched the baseline (AbsRel 0.055), so the gap comes from the inter-frame attention change,
+not from removing the point head; that configuration alone is 1.13-1.16x faster.
+
 ## 📝 To-Do List
 
 - [X] Release project paper.

@@ -34,6 +34,7 @@ def test_depth_metrics_use_median_scale():
 
 def test_model_from_config_dispatch(monkeypatch, tmp_path):
     import eval_colmap_rgbd
+
     import omnivggt.models.omnivggt as omnivggt_module
     from omnivggt.models.omnivggt_omega import OmniVGGTOmega
 
