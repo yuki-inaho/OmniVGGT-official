@@ -24,7 +24,8 @@ from .wildrgb import Wildrgb
 from omnivggt.datasets.utils.transforms import ImgNorm, ColorJitter
 
 def get_data_loader(dataset, batch_size, num_workers=8,
-                    shuffle=True, drop_last=True, pin_mem=True):
+                    shuffle=True, drop_last=True, pin_mem=True, full_clips=False):
+    """``full_clips=True``: every step is one clip of ``batch_size`` views (AnchorFrameSampler), not several."""
     import torch
     from omnivggt.datasets.utils.misc import get_world_size, get_rank
     
@@ -35,8 +36,11 @@ def get_data_loader(dataset, batch_size, num_workers=8,
     
     try:
         sampler = dataset.make_sampler(batch_size, shuffle=shuffle, world_size=world_size,
-                                       rank=rank, drop_last=drop_last)
-    except (AttributeError, NotImplementedError):
+                                       rank=rank, drop_last=drop_last, full_clips=full_clips)
+    except (AttributeError, NotImplementedError) as err:
+        if full_clips:
+            raise ValueError(f"full_clips needs a dataset with the anchor-frame sampler, "
+                             f"got {type(dataset).__name__}") from err
         # not avail for this dataset
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.DistributedSampler(

@@ -76,13 +76,17 @@ def round_by(total, multiple, up=False):
 
 
 class AnchorFrameSampler(BatchedRandomSampler):
+    """Yields (anchor ids..., feat_idx, batch_size): the batch_size images of one step are split into clips of
+    batch_size // len(anchor ids) views each; full_clips=True always yields one clip holding all the images."""
+
     def __init__(self, dataset, batch_size, pool_size, world_size=1,
-                 rank=0, drop_last=True, recent_buffer_size=10000):
+                 rank=0, drop_last=True, recent_buffer_size=10000, full_clips=False):
         # Pass world_size and rank to parent to enable proper distributed sampling
         super().__init__(dataset, 1, pool_size, world_size=world_size, rank=rank, drop_last=drop_last)
         self.batch_size = 1                       # 每次产出一个"逻辑样本"
         self.image_num_batch = batch_size         # 逻辑样本内的图片/帧数量
         self.recent_buffer_size = int(recent_buffer_size)
+        self.full_clips = full_clips
 
     def __len__(self):
         return self.total_size 
@@ -114,7 +118,9 @@ class AnchorFrameSampler(BatchedRandomSampler):
             recent_mask[local_pos] = True
 
        
-        if self.image_num_batch == 24:
+        if self.full_clips:
+            valid_lengths = [1]
+        elif self.image_num_batch == 24:
             valid_lengths = [1, 2, 4, 6, 8, 12]
         elif self.image_num_batch == 18:
             valid_lengths = [1, 2, 3, 6, 9]

@@ -32,6 +32,7 @@ def normalize_camera_extrinsics_and_points_batch(
     scale_by_points: bool = True,
     normaliza_camera: bool = False,
     point_masks: Optional[torch.Tensor] = None,
+    target_scale: str = "all",
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Normalize camera extrinsics and corresponding 3D points.
@@ -46,6 +47,8 @@ def normalize_camera_extrinsics_and_points_batch(
         depths: Depth maps of shape (B, S, H, W)
         scale_by_points: Whether to normalize the scale based on point distances
         point_masks: Boolean masks for valid points of shape (B, S, H, W)
+        target_scale: Points whose mean distance sets the scale: "all" valid points, or only the valid points
+            of the first frame ("first_frame", a scale fixed by frame 0 as in causal/streaming use)
     
     Returns:
         Tuple containing:
@@ -54,6 +57,8 @@ def normalize_camera_extrinsics_and_points_batch(
         - Normalized world points (same shape as input world_points)
         - Normalized depths (same shape as input depths)
     """
+    if target_scale not in ("all", "first_frame"):
+        raise ValueError(f"target_scale must be 'all' or 'first_frame', got {target_scale!r}")
     # Validate inputs
     check_valid_tensor(extrinsics, "extrinsics")
     check_valid_tensor(cam_points, "cam_points")
@@ -111,9 +116,14 @@ def normalize_camera_extrinsics_and_points_batch(
             new_cam_points = None
         new_depths = depths.clone()
 
-        dist = new_world_points.norm(dim=-1)
-        dist_sum = (dist * point_masks).sum(dim=[1,2,3])
-        valid_count = point_masks.sum(dim=[1,2,3])
+        scale_points, scale_masks = new_world_points, point_masks
+        if target_scale == "first_frame":
+            scale_points, scale_masks = new_world_points[:, :1], point_masks[:, :1]
+            if not scale_masks.flatten(1).any(dim=1).all():
+                raise ValueError("target_scale='first_frame' needs valid points in frame 0 of every sample")
+        dist = scale_points.norm(dim=-1)
+        dist_sum = (dist * scale_masks).sum(dim=[1,2,3])
+        valid_count = scale_masks.sum(dim=[1,2,3])
         avg_scale = (dist_sum / (valid_count + 1e-3)).clamp(min=1e-6, max=1e6)
 
 

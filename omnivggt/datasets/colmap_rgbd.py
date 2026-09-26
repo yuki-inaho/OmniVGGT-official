@@ -12,6 +12,8 @@ A split (``train`` / ``val`` / ``smoke``) is the set of frames referenced by the
 sequences of that split; the exporter separates splits with guard frames.  Views
 of one sample are the anchor frame plus frames drawn from its ``top_k`` nearest
 poses inside the same scene and split, so no view crosses a split boundary.
+With ``view_selection="sequential"`` the views are ascending frames a fixed stride
+apart, starting at the anchor or earlier so that they end inside the scene/split.
 """
 
 import json
@@ -46,6 +48,15 @@ def _check_metadata(meta: dict, root: Path) -> float:
     return 1e-3
 
 
+def _check_stride(sequential_stride):
+    """One positive int, or a non-empty list/tuple of them (one is drawn per sample)."""
+    strides = [sequential_stride] if isinstance(sequential_stride, int) else sequential_stride
+    if not (isinstance(strides, (list, tuple)) and strides and all(isinstance(s, int) and s > 0 for s in strides)):
+        raise ValueError(f"sequential_stride must be a positive int or a non-empty list of them, "
+                         f"got {sequential_stride!r}")
+    return sequential_stride if isinstance(sequential_stride, int) else list(sequential_stride)
+
+
 class ColmapRgbd(BaseStereoViewDataset):
     def __init__(
         self,
@@ -63,7 +74,7 @@ class ColmapRgbd(BaseStereoViewDataset):
             raise ValueError(f"split must be one of {SPLIT_NAMES}, got {split!r}")
         if view_selection not in ("random_topk", "sequential"):
             raise ValueError(f"unknown view_selection {view_selection!r}")
-        self.view_selection, self.sequential_stride = view_selection, sequential_stride
+        self.view_selection, self.sequential_stride = view_selection, _check_stride(sequential_stride)
         self.dataset_label = "ColmapRgbd"
         self.split, self.top_k, self.z_far = split, top_k, z_far
         roots = [roots] if isinstance(roots, (str, Path)) else list(roots)
@@ -72,7 +83,7 @@ class ColmapRgbd(BaseStereoViewDataset):
 
         self.rgb_paths, self.depth_paths, self.scene_labels = [], [], []
         self.intrinsics, self.camera_to_world, self.rank = [], [], {}
-        self.depth_scale = []
+        self.depth_scale, self.scene_span = [], []  # scene_span: (first, last) index of the frame's scene/split
         for root in map(Path, roots):
             depth_scale = _check_metadata(json.loads((root / "dataset.json").read_text()), root)
             for scene in sorted(p for p in (root / "scenes").iterdir() if p.is_dir()):
@@ -99,17 +110,29 @@ class ColmapRgbd(BaseStereoViewDataset):
             self.intrinsics.append(np.asarray(intrinsics[frame], dtype=np.float32))
             self.camera_to_world.append(c2w[local].astype(np.float32))
             self.depth_scale.append(depth_scale)
+            self.scene_span.append((offset, offset + len(frames) - 1))
             self.rank[offset + local] = ranking[local] + offset
 
     def __len__(self):
         return len(self.full_idxs)
 
+    def sequential_window(self, anchor: int, num: int, stride: int) -> list:
+        """Indices of ``num`` ascending frames ``stride`` apart, starting at ``anchor``; a window that would leave
+        the anchor's scene/split starts earlier, at ``last - (num - 1) * stride``, so that it ends on its last frame."""
+        first, last = self.scene_span[anchor]
+        start = min(anchor, last - (num - 1) * stride)
+        if start < first:
+            raise ValueError(f"{num} views {stride} frames apart do not fit in the {last - first + 1} frames of "
+                             f"{self.scene_labels[anchor]} in split {self.split!r}")
+        return list(range(start, start + num * stride, stride))
+
     def _get_views(self, index, num, resolution, rng):
         anchor = self.full_idxs[index]
         if self.view_selection == "sequential":
-            chosen = [anchor + k * self.sequential_stride for k in range(num)]
-            if chosen[-1] >= len(self.rgb_paths) or self.scene_labels[chosen[-1]] != self.scene_labels[anchor]:
-                raise IndexError(f"sequential views from {anchor} leave the scene/split")
+            stride = self.sequential_stride
+            if isinstance(stride, list):
+                stride = int(rng.choice(stride))
+            chosen = self.sequential_window(anchor, num, stride)
         elif num > 1:
             candidates = self.rank[anchor][: min(self.top_k, len(self.rank[anchor]))]
             chosen = [anchor, *rng.choice(candidates, size=num - 1, replace=True).tolist()]

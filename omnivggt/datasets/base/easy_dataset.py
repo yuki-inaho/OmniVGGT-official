@@ -31,12 +31,12 @@ class EasyDataset:
         pass  # nothing to do by default
 
     def make_sampler(self, batch_size, shuffle=True, 
-                     world_size=1, rank=0, drop_last=True):
+                     world_size=1, rank=0, drop_last=True, full_clips=False):
         num_of_aspect_ratios = len(self._resolutions)
 
         return AnchorFrameSampler(self, batch_size, num_of_aspect_ratios, 
                                   world_size=world_size, 
-                                  rank=rank, drop_last=drop_last)
+                                  rank=rank, drop_last=drop_last, full_clips=full_clips)
 
 
 

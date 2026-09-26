@@ -15,6 +15,7 @@ from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed, DistributedDataParallelKwargs
 
 from omnivggt.utils.configs import parse_configs
+from omnivggt.datasets import get_data_loader
 from omnivggt.datasets.utils.misc import merge_dicts
 from omnivggt.utils.misc import select_first_batch
 from omnivggt.utils.normalization import normalize_camera_extrinsics_and_points_batch
@@ -23,7 +24,6 @@ from visual_util import (
     get_world_points_from_depth,
 )
 from train_utils import (
-    build_dataset,
     configure_schedule,
     evaluation_weights,
     setup_logging,
@@ -86,13 +86,18 @@ if __name__ == '__main__':
     # ======================================================
     logger.info("Building datasets...")
     
-    # Training dataset
-    train_dataloader = build_dataset(
-        dataset=cfg.train_dataset,
+    # Training dataset (full_clips: every step is one clip of all its images)
+    logger.info(f"Building Train DataLoader for dataset: {cfg.train_dataset} "
+                f"(full_clips={cfg.get('full_clips', False)})")
+    train_dataloader = get_data_loader(
+        cfg.train_dataset,
         batch_size=cfg.get("train_batch_images", 24),
         num_workers=cfg.get("num_workers", 8),
-        test=False
+        full_clips=cfg.get("full_clips", False),
     )
+    logger.info(f"Train dataset length: {len(train_dataloader)}")
+    target_scale = cfg.get("target_scale", "all")  # points whose mean distance sets the target scale
+    logger.info(f"target_scale={target_scale}")
     
     # ======================================================
     # 3. Optimizer and Loss
@@ -224,6 +229,7 @@ if __name__ == '__main__':
                 world_points=batch['world_points'],
                 depths=batch['depth'],
                 point_masks=batch['valid_mask'],
+                target_scale=target_scale,
             )
             
             # Store original inputs for model
