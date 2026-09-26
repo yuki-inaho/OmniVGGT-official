@@ -14,7 +14,9 @@ A bounded cache is partitioned (design doc §4; no row is in two parts) into
 * long-patch: at most ``long_patch`` other patch tokens, selected per token.
 
 The long-term stores are selected at the commit, from every candidate of the written cache, by the policy's
-selector; ties go to the newer frame, then to the smaller token id.
+selector; ties go to the newer frame, then to the smaller token id. With ``quant`` the long-patch store keeps
+INT8/INT4 codes (asymmetric, design doc §6): a token is quantised once, when it enters the store, and keeps its
+codes and block scale/offset until it is evicted; the other parts stay in the cache dtype.
 """
 
 import math
@@ -26,7 +28,9 @@ import torch
 from torch import Tensor
 
 SELECTOR_NAMES = ("query", "xstream", "recency", "random")
-QUANT_NAMES = ("int8", "int4")
+QUANT_BITS = {"int8": 8, "int4": 4}
+QUANT_NAMES = tuple(QUANT_BITS)
+QUANT_BLOCK = 64  # K: tokens of one channel per scale/offset; V: channels of one token
 XSTREAM_POOL = 16  # patch queries per pooled row of XStreamVGGT's score
 RANDOM_SEED = 42
 
@@ -212,6 +216,133 @@ def top_frames(scores: Tensor, frame_id: Tensor, candidates: Tensor, k: int) -> 
     return frames[_ranked(frame_scores, frames, torch.zeros_like(frames))[:k]]
 
 
+def _check_bits(bits: int) -> None:
+    if bits not in QUANT_BITS.values():
+        raise ValueError(f"bits must be one of {sorted(QUANT_BITS.values())}, got {bits}")
+
+
+def _pack(codes: Tensor, bits: int) -> Tensor:
+    """uint8 codes: one per byte (8 bits) or two per byte along the last axis (4 bits: low nibble first)."""
+    if bits == 8:
+        return codes
+    if codes.shape[-1] % 2:
+        raise ValueError(f"INT4 packs pairs of channels: the last axis must be even, got {codes.shape[-1]}")
+    return codes[..., 0::2] | (codes[..., 1::2] << 4)
+
+
+def _unpack(packed: Tensor, bits: int) -> Tensor:
+    if bits == 8:
+        return packed
+    return torch.stack([packed & 0xF, packed >> 4], dim=-1).flatten(-2)
+
+
+def _block_quantize(x: Tensor, dim: int, bits: int) -> Tuple[Tensor, Tensor, Tensor]:
+    """Asymmetric quantisation of ``x`` [B, H, N, D] in blocks of ``QUANT_BLOCK`` consecutive entries along ``dim``.
+
+    Per block, s = max((x_max - x_min) / (2^b - 1), eps) and q = clip(round((x - x_min) / s), 0, 2^b - 1), so
+    x_min + s q is within s/2 of x. Returns packed uint8 codes and the scale and offset (x_min) per block, stored
+    in ``x.dtype``; the codes are rounded against the stored scale and offset.
+    """
+    _check_bits(bits)
+    levels = 2**bits - 1
+    work = x.to(torch.promote_types(x.dtype, torch.float32))
+    block_of = torch.arange(x.shape[dim], device=x.device) // QUANT_BLOCK
+    index = block_of.view([-1 if axis == dim else 1 for axis in range(x.dim())]).expand_as(work)
+    shape = list(x.shape)
+    shape[dim] = int(block_of[-1]) + 1
+    low = work.new_full(shape, float("inf")).scatter_reduce(dim, index, work, "amin")
+    high = work.new_full(shape, float("-inf")).scatter_reduce(dim, index, work, "amax")
+    scale = ((high - low) / levels).clamp_min(torch.finfo(x.dtype).tiny).to(x.dtype)
+    offset = low.to(x.dtype)
+    step = scale.to(work.dtype).index_select(dim, block_of)
+    codes = torch.round((work - offset.to(work.dtype).index_select(dim, block_of)) / step).clamp_(0, levels)
+    return _pack(codes.to(torch.uint8), bits), scale, offset
+
+
+def quantize_k(k: Tensor, bits: int) -> Tuple[Tensor, Tensor, Tensor]:
+    """Keys [B, H, N, D]: each channel of a head in blocks of 64 tokens; scale/offset [B, H, ceil(N/64), D]."""
+    return _block_quantize(k, 2, bits)
+
+
+def quantize_v(v: Tensor, bits: int) -> Tuple[Tensor, Tensor, Tensor]:
+    """Values [B, H, N, D]: each token of a head in blocks of 64 channels; scale/offset [B, H, N, ceil(D/64)]."""
+    return _block_quantize(v, 3, bits)
+
+
+def dequantize(codes: Tensor, scale: Tensor, offset: Tensor, bits: int) -> Tensor:
+    """offset + scale * code, with ``scale`` and ``offset`` given per entry (the shape of the unpacked codes)."""
+    _check_bits(bits)
+    work = torch.promote_types(scale.dtype, torch.float32)
+    return (offset.to(work) + scale.to(work) * _unpack(codes, bits).to(work)).to(scale.dtype)
+
+
+class _QuantizedRows:
+    """Rows of a quantised long-patch store, each quantised once when it entered.
+
+    K codes keep a scale/offset per (block of up to 64 tokens that entered together, channel); a block is
+    released when none of its tokens is left. V codes keep theirs per (token, block of 64 channels).
+    """
+
+    def __init__(self, bits: int):
+        self.bits = bits
+        self.rows = 0
+        self.k_codes = self.v_codes = None  # [1, H, R, D * bits / 8] uint8
+        self.v_scale = self.v_offset = None  # [1, H, R, ceil(D / 64)]
+        self.k_scale = self.k_offset = None  # [1, H, K blocks, D]
+        self.block = self.frame_id = self.token_id = None  # [R] int64
+
+    def add(self, keys: Tensor, values: Tensor, frame_id: Tensor, token_id: Tensor) -> None:
+        """Quantise rows entering together ([1, H, R, D], in token order) and append them."""
+        k_codes, k_scale, k_offset = quantize_k(keys, self.bits)
+        v_codes, v_scale, v_offset = quantize_v(values, self.bits)
+        first_block = 0 if self.k_scale is None else self.k_scale.shape[2]
+        block = first_block + torch.arange(keys.shape[2], device=keys.device) // QUANT_BLOCK
+        parts = {"k_codes": k_codes, "v_codes": v_codes, "v_scale": v_scale, "v_offset": v_offset,
+                 "k_scale": k_scale, "k_offset": k_offset, "block": block, "frame_id": frame_id, "token_id": token_id}
+        for name, part in parts.items():
+            stored = getattr(self, name)
+            axis = 0 if part.dim() == 1 else 2
+            setattr(self, name, part if stored is None else torch.cat([stored, part], dim=axis))
+        self.rows += keys.shape[2]
+
+    def keep(self, keep: Tensor) -> None:
+        """Keep the rows of ``keep`` (bool mask) in their order; release the K blocks none of them refers to."""
+        if self.rows == 0 or bool(keep.all()):
+            return
+        rows = keep.nonzero().squeeze(1)
+        for name in ("k_codes", "v_codes", "v_scale", "v_offset"):
+            setattr(self, name, getattr(self, name)[:, :, rows])
+        for name in ("frame_id", "token_id"):
+            setattr(self, name, getattr(self, name)[rows])
+        used, self.block = torch.unique(self.block[rows], return_inverse=True)
+        self.k_scale, self.k_offset = self.k_scale[:, :, used], self.k_offset[:, :, used]
+        self.rows = rows.numel()
+
+    def dequantized(self) -> Tuple[Tensor, Tensor]:
+        dim = self.k_scale.shape[3]
+        keys = dequantize(self.k_codes, self.k_scale[:, :, self.block], self.k_offset[:, :, self.block], self.bits)
+        v_scale = self.v_scale.repeat_interleave(QUANT_BLOCK, dim=3)[..., :dim]
+        v_offset = self.v_offset.repeat_interleave(QUANT_BLOCK, dim=3)[..., :dim]
+        return keys, dequantize(self.v_codes, v_scale, v_offset, self.bits)
+
+    def nbytes(self) -> int:
+        """Codes plus scales and offsets."""
+        if self.rows == 0:
+            return 0
+        codes = self.k_codes.numel() + self.v_codes.numel()
+        params = self.k_scale.numel() + self.k_offset.numel() + self.v_scale.numel() + self.v_offset.numel()
+        return codes + params * self.k_scale.element_size()
+
+    def consistent(self) -> bool:
+        """Rows aligned across the arrays, and every K block referred to by a row (no stale metadata)."""
+        if self.rows == 0:
+            return self.k_scale is None or self.k_scale.shape[2] == 0
+        lengths = {self.k_codes.shape[2], self.v_codes.shape[2], self.v_scale.shape[2], self.v_offset.shape[2],
+                   self.block.numel(), self.frame_id.numel(), self.token_id.numel()}
+        blocks = self.k_scale.shape[2]
+        return lengths == {self.rows} and torch.unique(self.block).numel() == blocks == int(self.block.max()) + 1
+
+
 class LayerKVCache:
     """Keys and values of one layer, stored in ``dtype`` in a preallocated buffer that doubles when it is full.
 
@@ -226,8 +357,6 @@ class LayerKVCache:
             raise ValueError(f"need 1 <= special_count <= tokens_per_frame, got {special_count}, {tokens_per_frame}")
         if initial_frames < 1:
             raise ValueError(f"initial_frames must be positive, got {initial_frames}")
-        if policy.quant is not None:
-            raise NotImplementedError("quantisation is not implemented")
         self.policy = policy
         self.tokens_per_frame = tokens_per_frame
         self.special_count = special_count
@@ -235,21 +364,33 @@ class LayerKVCache:
         self.layer_id = layer_id
         self.budget = policy.budget(tokens_per_frame, special_count)
         self.last_frame = 0  # the last committed frame id
-        # a bounded cache holds at most its budget plus the current frame, so its buffer never grows
-        self._initial_rows = initial_frames * tokens_per_frame if policy.is_full else self.budget + tokens_per_frame
+        has_patches = tokens_per_frame > special_count
+        # the long-patch store of a layer with patches, quantised (layers without patches have none)
+        self._quant = _QuantizedRows(QUANT_BITS[policy.quant]) if policy.quant and has_patches else None
+        # the buffer holds the rows in the cache dtype: a bounded cache holds at most its budget (less a quantised
+        # long-patch store) plus the current frame, so its buffer never grows
+        if policy.is_full:
+            self._initial_rows = initial_frames * tokens_per_frame
+        else:
+            self._initial_rows = self.budget + tokens_per_frame - (policy.long_patch if self._quant else 0)
         self._pending = None  # frame id appended but not committed yet
         self._keys = self._values = None  # [B, H, capacity, D], allocated on the first append
         self._frame_id = self._token_id = None  # [capacity] int64, row metadata
-        self._rows = 0
+        self._rows = 0  # rows in the buffer
 
     @property
     def capacity(self) -> int:
+        """Rows the buffer (cache dtype) holds before it grows."""
         return 0 if self._keys is None else self._keys.shape[2]
 
     @property
     def size(self) -> int:
         """Number of stored rows (tokens), the current frame included while it is not committed."""
-        return self._rows
+        return self._rows + self._quantized_rows
+
+    @property
+    def _quantized_rows(self) -> int:
+        return 0 if self._quant is None else self._quant.rows
 
     def append(self, k: Tensor, v: Tensor, frame_id: int) -> None:
         """Write the current frame's keys and values ([B, H, n, D]) after the stored rows."""
@@ -277,14 +418,22 @@ class LayerKVCache:
         self._pending = frame_id
 
     def read(self) -> Tuple[Tensor, Tensor]:
-        """Keys and values of every stored row (views of the buffer), in the order of ``row_ids``."""
+        """Keys and values of every stored row, in the order of ``row_ids``: views of the buffer, followed by the
+        dequantised long-patch store if there is one."""
         if self._keys is None:
             raise RuntimeError("the cache is empty: append a frame first")
-        return self._keys[:, :, : self._rows], self._values[:, :, : self._rows]
+        keys, values = self._keys[:, :, : self._rows], self._values[:, :, : self._rows]
+        if not self._quantized_rows:
+            return keys, values
+        quantized_keys, quantized_values = self._quant.dequantized()
+        return torch.cat([keys, quantized_keys], dim=2), torch.cat([values, quantized_values], dim=2)
 
     def row_ids(self) -> Tuple[Tensor, Tensor]:
         """Frame id and token id of every row of ``read()``."""
-        return self._frame_id[: self._rows], self._token_id[: self._rows]
+        frame_id, token_id = self._frame_id[: self._rows], self._token_id[: self._rows]
+        if not self._quantized_rows:
+            return frame_id, token_id
+        return torch.cat([frame_id, self._quant.frame_id]), torch.cat([token_id, self._quant.token_id])
 
     def commit(self, q: Tensor, t: int, grid_hw: Optional[Tuple[int, int]] = None) -> None:
         """End step ``t``: keep what the policy allows for the next step.
@@ -300,7 +449,7 @@ class LayerKVCache:
         if grid_hw is not None and grid_hw[0] * grid_hw[1] != patches:
             raise ValueError(f"grid {grid_hw} does not hold the {patches} patch tokens of a frame")
         if not self.policy.is_full:
-            self._compact(self._select(q, t, grid_hw))
+            self._keep(*self._select(q, t, grid_hw))
         self._pending = None
         self.last_frame = t
 
@@ -318,7 +467,8 @@ class LayerKVCache:
         protected = torch.isin(frame_id, torch.tensor(protected_frames, device=frame_id.device))
         special = token_id < m
         long_special_frames, special_counts = torch.unique(frame_id[~protected & special], return_counts=True)
-        long_patch_tokens = int((~protected & ~special).sum())
+        long_patch = ~protected & ~special
+        long_patch_tokens = int(long_patch.sum())
         unique = torch.unique(frame_id * n + token_id).numel() == self.size
         checks = {
             "aligned": keys.shape[2] == values.shape[2] == frame_id.numel() == token_id.numel() == self.size,
@@ -330,18 +480,25 @@ class LayerKVCache:
             and bool((special_counts == m).all()),
             "long_patch": long_patch_tokens <= (self.policy.long_patch if n > m else 0),
         }
+        if self._quant is not None:  # the long-patch rows are exactly the quantised ones, and their blocks live
+            quantized = torch.zeros_like(long_patch)
+            quantized[self._rows:] = True  # row_ids lists the quantised store after the buffer
+            checks["long_patch_quantized"] = torch.equal(long_patch, quantized)
+            checks["quantized_blocks"] = self._quant.consistent()
         return {"size": self.size, "budget": self.budget, "long_special_frames": long_special_frames.numel(),
                 "long_patch_tokens": long_patch_tokens, **checks, "ok": all(checks.values())}
 
     def nbytes(self) -> int:
-        """Bytes of the stored keys and values (the stored rows, not the buffer capacity)."""
+        """Bytes of the stored keys and values (the stored rows, not the buffer capacity): the payload in the cache
+        dtype, plus the codes, scales and offsets of a quantised long-patch store."""
         if self._keys is None:
             return 0
         batch, heads, _, dim = self._keys.shape
-        return 2 * batch * heads * self._rows * dim * self._keys.element_size()
+        full_precision = 2 * batch * heads * self._rows * dim * self._keys.element_size()
+        return full_precision + (0 if self._quant is None else self._quant.nbytes())
 
-    def _select(self, q: Tensor, t: int, grid_hw: Optional[Tuple[int, int]]) -> Tensor:
-        """Rows (bool mask) kept after the commit of step ``t``."""
+    def _select(self, q: Tensor, t: int, grid_hw: Optional[Tuple[int, int]]) -> Tuple[Tensor, Tensor]:
+        """Rows (bool masks over ``row_ids``) kept after the commit of step ``t``, and the long-patch candidates."""
         policy = self.policy
         frame_id, token_id = self.row_ids()
         protected = (frame_id == 1) | (frame_id > t - policy.recent)
@@ -351,7 +508,7 @@ class LayerKVCache:
         select_patch = int(long_patch.sum()) > policy.long_patch
         keep = protected.clone()
         if not (select_special or select_patch):  # fewer candidates than the budget: keep them all
-            return keep | long_special | long_patch
+            return keep | long_special | long_patch, long_patch
         scores = self._scores(q, t, grid_hw)
         if select_special:
             kept_frames = top_frames(scores, frame_id, long_special, policy.long_special)
@@ -362,7 +519,23 @@ class LayerKVCache:
             keep[top_rows(scores, frame_id, token_id, long_patch, policy.long_patch)] = True
         else:
             keep |= long_patch
-        return keep
+        return keep, long_patch
+
+    def _keep(self, keep: Tensor, long_patch: Tensor) -> None:
+        """Apply the selection; kept long-patch rows still in the buffer enter the quantised store (once)."""
+        if self._quant is None:
+            self._compact(keep)
+            return
+        keep_buffer = keep[: self._rows].clone()
+        self._quant.keep(keep[self._rows:])
+        entering = (keep_buffer & long_patch[: self._rows]).nonzero().squeeze(1)
+        entering_frames = self._frame_id[entering]
+        for frame in torch.unique(entering_frames).tolist():  # blocks of 64 tokens never span two frames
+            rows = entering[entering_frames == frame]
+            self._quant.add(self._keys[:, :, rows], self._values[:, :, rows], self._frame_id[rows],
+                            self._token_id[rows])
+        keep_buffer[entering] = False
+        self._compact(keep_buffer)
 
     def _scores(self, q: Tensor, t: int, grid_hw: Optional[Tuple[int, int]]) -> Tensor:
         frame_id, token_id = self.row_ids()
