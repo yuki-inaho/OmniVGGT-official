@@ -863,6 +863,26 @@ def test_main_rejects_the_arguments_of_other_modes(tmp_path):
     assert not output.exists()
 
 
+def test_main_records_the_vram_limit_and_the_peaks(monkeypatch, tmp_path, roots):
+    import eval_stream
+
+    limits = []
+    monkeypatch.setattr(eval_stream, "apply_vram_limit", lambda device: limits.append(device) or {"limit_gb": 8.0})
+    result, _, _ = _run_main(monkeypatch, tmp_path, roots, ["--windows", "s0:12-19", "--mode", "bidir"])
+    assert limits[0] == "cpu" and result["provenance"]["vram"] == {"limit": {"limit_gb": 8.0}, "peaks": None}
+
+
+def test_main_refuses_a_vram_limit_on_the_cpu_before_reading_anything(monkeypatch, tmp_path):
+    import eval_stream
+
+    monkeypatch.setenv("OMNIVGGT_VRAM_LIMIT_GB", "8")
+    monkeypatch.setattr(eval_stream, "_load_model", lambda *args, **kwargs: pytest.fail("the model was loaded"))
+    argv = ["--model-config", "V5.json", "--checkpoint", "ckpt", "--roots", "missing", "--split", "val", "--preset",
+            "L8", "--mode", "bidir", "--device", "cpu", "--output", str(tmp_path / "result.json")]
+    with pytest.raises(ValueError, match="OMNIVGGT_VRAM_LIMIT_GB"):
+        eval_stream.main(argv)
+
+
 # ---------------------------------------------------------------- phase-5 chunk mode (VGGT-Long style, offline)
 CHUNK_ARGUMENTS = {"chunk": 4, "overlap": 2}
 ALIGNMENT = {"pixel_step": 4, "min_weight_ratio": 0.1, "irls_iterations": 5, "huber_delta": "median_initial_residual"}

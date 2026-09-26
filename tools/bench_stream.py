@@ -4,8 +4,10 @@ Synthetic RGB-D frames (content does not change the cost) are fed one at a time 
 the requested steps t the step latency (CUDA events on GPU, perf_counter on CPU), the median of the last five
 steps, the analytic KV bytes and, on GPU, memory allocated and the peak so far are recorded. An out-of-memory
 step is recorded as such and ends the run.
+``OMNIVGGT_VRAM_LIMIT_GB`` (GiB, optional) caps the memory of the process on the GPU before the model is built
+(``omnivggt.utils.vram``); the output records the cap and the peak memory of the run.
 
-usage: PYTHONPATH=tools uv run python -m bench_stream --model-config VARIANT.json --random-init \
+usage: [OMNIVGGT_VRAM_LIMIT_GB=G] PYTHONPATH=tools uv run python -m bench_stream --model-config VARIANT.json --random-init \
            --policy full|JSON --steps 1,32,128,256,512,1000 [--precision bf16] --output bench.json
 """
 
@@ -25,6 +27,7 @@ from eval_stream import git_state
 
 from omnivggt.stream.kv_cache import CachePolicy
 from omnivggt.stream.streaming import StreamingOmega
+from omnivggt.utils.vram import apply_vram_limit, memory_peaks
 
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 
@@ -107,6 +110,7 @@ def main(argv=None) -> int:
 
     args = build_parser().parse_args(argv)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    vram_limit = apply_vram_limit(device)  # OMNIVGGT_VRAM_LIMIT_GB, before the model is built
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     options = {"causal": True, "depth_norm": "first_frame"}
@@ -130,6 +134,7 @@ def main(argv=None) -> int:
         "gpu": torch.cuda.get_device_name() if device == "cuda" else "cpu",
         "torch": torch.__version__,
         "git": git_state(),
+        "vram": {"limit": vram_limit, "peaks": memory_peaks(device)},
         "results": rows,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

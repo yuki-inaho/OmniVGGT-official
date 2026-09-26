@@ -521,3 +521,31 @@ def test_scoring_the_checkpoints_does_not_change_the_training_run(recipe, tiny_b
                             for run in ("scored", "unscored"))
         assert scored.keys() == unscored.keys()
         assert all(torch.equal(scored[key], unscored[key]) for key in scored), name
+
+
+# --- OMNIVGGT_VRAM_LIMIT_GB ------------------------------------------------------------------------------------------
+
+
+def test_the_vram_limit_is_applied_before_the_model_is_built_and_recorded_with_the_peaks(recipe, tiny_build, tmp_path,
+                                                                                          monkeypatch):
+    recipe()
+    init, _ = _init_checkpoint(tmp_path)
+    order, load = [], train_stream.load_model
+    monkeypatch.setattr(train_stream, "apply_vram_limit",
+                        lambda device: order.append(("limit", str(device))) or {"limit_gb": 8.0})
+    monkeypatch.setattr(train_stream, "load_model", lambda cfg, device: order.append(("model",)) or load(cfg, device))
+    output = tmp_path / "stream_TX"
+    assert train_stream.main(_arguments(init, output)) == 0
+    assert order == [("limit", "cpu"), ("model",)]
+    record = json.loads((output / "omnivggt-omega-colmap-rgbd" / "stream_training.json").read_text())
+    assert record["vram"] == {"limit": {"limit_gb": 8.0}}
+    assert record["summary"]["vram_peaks"] is None and record["summary"]["seconds"] > 0  # no peaks on the CPU
+
+
+def test_a_vram_limit_on_the_cpu_is_an_error_before_anything_is_written(recipe, tiny_build, tmp_path, monkeypatch):
+    recipe()
+    init, _ = _init_checkpoint(tmp_path)
+    monkeypatch.setenv("OMNIVGGT_VRAM_LIMIT_GB", "8")
+    with pytest.raises(ValueError, match="OMNIVGGT_VRAM_LIMIT_GB"):
+        train_stream.main(_arguments(init, tmp_path / "stream_TX"))
+    assert not (tmp_path / "stream_TX").exists()

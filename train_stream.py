@@ -35,8 +35,12 @@ anchors. The ``--keep-best`` checkpoints with the lowest score stay (``final_che
 towards them; the latest one also stays while the run trains); ``checkpoints.json`` records every score and what
 was removed, and TensorBoard ``val/*`` the scores.
 
-usage: uv run --locked python train_stream.py --config configs/train_colmap_rgbd_omega.py --init T-A/final_checkpoint \
-           --policy full|JSON [--window-length 48] [--updates 1560] [--keep-best 1] [--val-windows 4] --output-dir OUT
+``OMNIVGGT_VRAM_LIMIT_GB`` (GiB, optional) caps the memory of the process on its CUDA device before the model is
+built (``omnivggt.utils.vram``); ``stream_training.json`` records the cap and, in its final ``summary``, the peaks.
+
+usage: [OMNIVGGT_VRAM_LIMIT_GB=G] uv run --locked python train_stream.py --config configs/train_colmap_rgbd_omega.py \
+           --init T-A/final_checkpoint --policy full|JSON [--window-length 48] [--updates 1560] [--keep-best 1] \
+           [--val-windows 4] --output-dir OUT
 """
 
 import argparse
@@ -61,6 +65,7 @@ from omnivggt.stream.kv_cache import CachePolicy
 from omnivggt.stream.streaming import StreamingOmega
 from omnivggt.utils.configs import read_config
 from omnivggt.utils.normalization import normalize_camera_extrinsics_and_points_batch
+from omnivggt.utils.vram import apply_vram_limit, memory_peaks
 from train_utils import (
     SMOKE_SPLIT,
     VALIDATION_PROGRESS,
@@ -352,6 +357,7 @@ def main(argv=None) -> int:
     PartialState()  # train_utils logs through accelerate
     set_seed(cfg["seed"])
     device = torch.device(args.device)
+    vram_limit = apply_vram_limit(device)  # OMNIVGGT_VRAM_LIMIT_GB, before the model is built
     model, _ = load_model(cfg, device)  # strict load of --init; writes <output-dir>/weight_transfer_report.json
     model.train()
     trainer = StreamTrainer(model, policy, cfg, args.updates)
@@ -370,6 +376,7 @@ def main(argv=None) -> int:
         "validation": {"split": SMOKE_SPLIT, "windows": args.val_windows, "window_length": args.window_length,
                        "stride": smallest_stride(dataset.sequential_stride), "progress": VALIDATION_PROGRESS,
                        "anchors": [window["anchor"] for window in windows]},
+        "vram": {"limit": vram_limit},
         "window_anchors": anchors.tolist(),
     }
     (save_dir / "stream_training.json").write_text(json.dumps(run, indent=1) + "\n")
@@ -415,6 +422,9 @@ def main(argv=None) -> int:
     checkpoint("final_checkpoint", args.updates, final=True)
     if writer is not None:
         writer.close()
+    run["summary"] = {"seconds": time.time() - clock["start"], "vram_peaks": memory_peaks(device)}
+    (save_dir / "stream_training.json").write_text(json.dumps(run, indent=1) + "\n")
+    logger.info(f"done: {json.dumps(run['summary'])}")
     return 0
 
 

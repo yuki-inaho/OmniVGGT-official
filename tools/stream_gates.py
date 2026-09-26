@@ -9,8 +9,10 @@
     once, never re-quantised).
 
 The model is built with ``causal=True, depth_norm="first_frame"`` and run in fp32 with TF32 off.
+``OMNIVGGT_VRAM_LIMIT_GB`` (GiB, optional) caps the memory of the process on the GPU before the model is loaded
+(``omnivggt.utils.vram``); the output records the cap and the peak memory of the run.
 
-usage: PYTHONPATH=tools uv run python -m stream_gates --model-config VARIANT.json --checkpoint W|DIR \
+usage: [OMNIVGGT_VRAM_LIMIT_GB=G] PYTHONPATH=tools uv run python -m stream_gates --model-config VARIANT.json --checkpoint W|DIR \
            --roots R0 R1 --split smoke --window s0:950-965 --policy JSON --output gates.json
 """
 
@@ -28,6 +30,7 @@ from eval_stream import WindowLoader, git_state, parse_window, precision_setup, 
 
 from omnivggt.stream.kv_cache import CachePolicy
 from omnivggt.stream.streaming import StreamingOmega, all_caches
+from omnivggt.utils.vram import apply_vram_limit, memory_peaks
 
 POSE_TOLERANCE = 1e-4  # fp32 real weights (§1.1 of the workdoc)
 DEPTH_REL_TOLERANCE = 1e-3
@@ -162,6 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    vram_limit = apply_vram_limit(device)  # OMNIVGGT_VRAM_LIMIT_GB, before the model is loaded
     _, precision = precision_setup("fp32", device)
     model, weights = _load_model(args.checkpoint, device, args.model_config, causal=True, depth_norm="first_frame")
     policy = CachePolicy(**json.loads(args.policy))
@@ -186,6 +190,7 @@ def main(argv=None) -> int:
         "model_config": {"path": str(args.model_config), "sha256": _sha256(args.model_config)},
         "weights": {"file": f"{Path(weights).parent.name}/{Path(weights).name}", "sha256": _sha256(Path(weights))},
         "git": git_state(),
+        "vram": {"limit": vram_limit, "peaks": memory_peaks(device)},
         "gates": gates,
         "ok": all(gate["ok"] for gate in gates.values()),
     }

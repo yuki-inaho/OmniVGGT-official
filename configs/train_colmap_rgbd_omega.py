@@ -29,6 +29,10 @@
 #                                 final_checkpoint only (default: 1). The last epoch is saved as final_checkpoint only.
 #   OMNIVGGT_VAL_SAMPLES          training steps of the smoke split (fixed samples, no augmentation) that score every
 #                                 checkpoint (default: 16); the val split is left for the confirmation
+#   OMNIVGGT_VRAM_LIMIT_GB        read by the training script, not this config: cap in GiB of the CUDA memory of each
+#                                 training process (torch.cuda.set_per_process_memory_fraction before the model is
+#                                 built; above the device memory or without CUDA it is an error); unset: no cap.
+#                                 The cap and the peaks are logged (and recorded in checkpoints.json)
 # Stream-Omega (frame-causal) training; each option is independent of the others:
 #   OMNIVGGT_CAUSAL               1 trains frame-causal inter-frame attention, needs CAM_DROP_PROB=1 (default: 0)
 #   OMNIVGGT_DEPTH_NORM           joint (all views with depth) or first_frame depth-input normalization (default: joint)

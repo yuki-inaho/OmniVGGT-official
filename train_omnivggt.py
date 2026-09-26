@@ -18,6 +18,7 @@ from omnivggt.utils.configs import parse_configs
 from omnivggt.datasets import get_data_loader
 from omnivggt.datasets.utils.misc import merge_dicts
 from omnivggt.utils.misc import select_first_batch
+from omnivggt.utils.vram import apply_vram_limit, memory_peaks
 from visual_util import (
     predictions_to_glb,
     get_world_points_from_depth,
@@ -77,6 +78,8 @@ if __name__ == '__main__':
     setup_logging(accelerator)
     set_seed(cfg.get("seed", 42))
     logger.info(f"Random seed set to {cfg.get('seed', 42)}")
+    vram_limit = apply_vram_limit(accelerator.device)  # OMNIVGGT_VRAM_LIMIT_GB (each process), before the model
+    logger.info(f"VRAM limit: {vram_limit}")
     
     writer = None
     if accelerator.is_main_process:
@@ -167,7 +170,7 @@ if __name__ == '__main__':
                                          target_scale=target_scale, seed=cfg.get("seed", 42),
                                          device=accelerator.device, autocast=accelerator.autocast)
         extra = {"split": "smoke", "samples": cfg.get("val_samples", 16), "progress": VALIDATION_PROGRESS,
-                 "components": score}
+                 "components": score, "vram": {"limit": vram_limit, "peaks": memory_peaks(accelerator.device)}}
         if final:
             entry = keeper.finalize(name, score["objective"], step, extra=extra)
         else:
@@ -397,4 +400,5 @@ if __name__ == '__main__':
             writer.close()
             logger.info("TensorBoard logging finished")
     
+    logger.info(f"VRAM limit {vram_limit}, peaks {memory_peaks(accelerator.device)}")
     logger.info("All done!")

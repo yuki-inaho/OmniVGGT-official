@@ -28,8 +28,10 @@ its alignment for ``chunk``), the analytic KV bytes after every stream step, the
 memory allocated / peak above the window start.
 ``--precision fp32`` runs without autocast and with TF32 off (accuracy rows); ``bf16`` adds bf16
 autocast and a bf16 stream cache (efficiency only).
+``OMNIVGGT_VRAM_LIMIT_GB`` (GiB, optional) caps the memory of the process on its CUDA device before the model is
+loaded (``omnivggt.utils.vram``); the output provenance records the cap and the peak memory of the run.
 
-usage: PYTHONPATH=tools uv run python -m eval_stream --model-config VARIANT.json --checkpoint W|DIR \
+usage: [OMNIVGGT_VRAM_LIMIT_GB=G] PYTHONPATH=tools uv run python -m eval_stream --model-config VARIANT.json --checkpoint W|DIR \
            --roots R0 R1 --split {val,smoke} (--windows "s0:950-981,s1:950-981" | --preset L8) \
            --mode {bidir,bidir_f0,bidir_prefix,stream,causal_batch,bidir_band,g2f,chunk} [--policy full|JSON] \
            [--band-width W] [--g2f-k {3,6,9} [--g2f-causal]] [--chunk K --overlap O] [--conditions depth rgb] \
@@ -63,6 +65,7 @@ from rgbd_pose_pipeline.se3 import rotation_angle_deg
 from stream_metrics import mean_over_windows, window_metrics
 
 from omnivggt.utils.pose_enc import pose_encoding_to_extri_intri
+from omnivggt.utils.vram import apply_vram_limit, memory_peaks
 
 MODES = {
     "bidir": {"causal": False, "depth_norm": "joint"},
@@ -556,6 +559,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    vram_limit = apply_vram_limit(args.device)  # OMNIVGGT_VRAM_LIMIT_GB, before anything is loaded
     policy = check_options(args.mode, args.policy)
     arguments = check_mode_arguments(args.mode, args.band_width, args.g2f_k, args.g2f_causal, args.chunk, args.overlap)
     options = model_options(args.mode, arguments)
@@ -597,6 +601,7 @@ def main(argv=None) -> int:
             "git": git_state(),
             "device": str(args.device),
             "torch": torch.__version__,
+            "vram": {"limit": vram_limit, "peaks": memory_peaks(args.device)},
         },
         "split": args.split,
         "roots": [Path(root).name for root in args.roots],
