@@ -244,6 +244,51 @@ def test_stream_outputs_ignore_later_frames(condition):
     assert not torch.equal(runs[0][-1]["pose_enc"], changed_last["pose_enc"])
 
 
+@pytest.mark.parametrize("selector", ["query", "xstream", "recency", "random"])
+def test_bounded_cache_larger_than_the_history_equals_the_full_cache(selector):
+    model, sequence = _causal_model(), _sequence()
+    batch = _batch(model, sequence, "depth")
+    roomy = CachePolicy(recent=2, long_special=100, long_patch=10_000, selector=selector)
+    stream = StreamingOmega(model, roomy)
+    streamed = _stream(stream, sequence, "depth")
+    for key in OUTPUTS:
+        assert _relative_error(streamed[key], batch[key]) <= 1e-10, key
+    assert all(cache.size == STREAM_FRAMES * cache.tokens_per_frame for cache in all_caches(stream.caches))
+
+
+@pytest.mark.parametrize("selector, quant", [("query", None), ("xstream", "int8"), ("recency", "int4"),
+                                             ("random", None)])
+def test_small_bounded_caches_stay_within_budget_over_20_frames(selector, quant):
+    policy = CachePolicy(recent=1, long_special=1, long_patch=4, selector=selector, quant=quant)
+    model, sequence = _causal_model(), _sequence(frames=20)
+    stream = StreamingOmega(model, policy)
+    tokens = model.aggregator.patch_start_idx + 2 * 3
+    budgets = {"global": 2 * tokens + 17 + 4, "register": 17 * 3, "camera": 3}
+    for frame in range(20):
+        out = stream.step(*_frame_inputs(sequence, frame, "depth"))
+        assert all(torch.isfinite(out[key]).all() for key in OUTPUTS)
+        for kind in ("global", "register"):
+            for cache in stream.caches[kind].values():
+                invariants = cache.invariants()
+                assert invariants["ok"] and cache.size <= cache.budget == budgets[kind], (kind, invariants)
+        for cache in (cache for row in stream.caches["camera"] for cache in row):
+            assert cache.invariants()["ok"] and cache.size <= cache.budget == budgets["camera"]
+    assert stream.kv_bytes() == sum(cache.nbytes() for cache in all_caches(stream.caches))
+
+
+def test_backbone_caches_store_the_given_dtype_and_camera_caches_the_head_dtype():
+    model, sequence = _causal_model(), _sequence(frames=3)
+    batch = _batch(model, sequence, "depth")
+    stream = StreamingOmega(model, CachePolicy.full(), dtype=torch.float32)
+    streamed = _stream(stream, sequence, "depth")
+    backbone = [*stream.caches["global"].values(), *stream.caches["register"].values()]
+    assert all(cache.read()[0].dtype == torch.float32 for cache in backbone)
+    assert all(cache.read()[0].dtype == torch.float64 for row in stream.caches["camera"] for cache in row)
+    assert streamed["pose_enc"].dtype == torch.float64  # the stored keys are cast to the queries' dtype
+    for key in OUTPUTS:
+        assert _relative_error(streamed[key], batch[key]) <= 1e-5, key
+
+
 def test_frames_of_another_size_raise():
     stream = StreamingOmega(_causal_model(), CachePolicy.full())
     stream.step(torch.rand(1, 3, 28, 42, dtype=torch.float64))
