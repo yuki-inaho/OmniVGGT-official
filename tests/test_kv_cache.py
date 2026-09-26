@@ -1,9 +1,23 @@
 """Per-layer KV cache of the streaming model (omnivggt.stream.kv_cache)."""
 
+import numpy as np
 import pytest
 import torch
 
-from omnivggt.stream.kv_cache import CachePolicy, LayerKVCache
+from omnivggt.stream.kv_cache import (
+    SELECTOR_NAMES,
+    CachePolicy,
+    Candidates,
+    LayerKVCache,
+    query_groups,
+    select_query,
+    select_random,
+    select_recency,
+    select_xstream,
+    top_frames,
+    top_rows,
+    xstream_rows,
+)
 
 HEADS, DIM = 2, 4
 
@@ -241,3 +255,133 @@ def test_policy_from_an_infeasible_global_budget_raises(budget, recent, long_spe
 def test_invalid_policies_raise(kwargs):
     with pytest.raises(ValueError):
         CachePolicy(**kwargs)
+
+
+# --- selectors ------------------------------------------------------------------------------------------------
+
+
+def _candidates(queries, keys, frame_id, token_id, special_count, grid_hw=None, layer_id=0, t=5):
+    return Candidates(queries, keys, torch.as_tensor(frame_id), torch.as_tensor(token_id), special_count, grid_hw,
+                      layer_id, t)
+
+
+def _random_qk(tokens, rows, seed=0, heads=2, dim=2):
+    generator = torch.Generator().manual_seed(seed)
+    return (torch.randn(1, heads, tokens, dim, generator=generator, dtype=torch.float64),
+            torch.randn(1, heads, rows, dim, generator=generator, dtype=torch.float64))
+
+
+def test_query_groups_of_the_g3_grid():
+    groups = query_groups(17, (21, 28))  # 392 x 294 at patch 14: 21 rows x 28 columns
+    sizes = torch.bincount(groups)
+    assert groups.shape == (605,) and sizes.numel() == 171  # 17 special + 11 x 14 patch groups
+    assert (sizes[:17] == 1).all() and sizes[17:].numel() == 154
+    assert sorted(sizes[17:].tolist()) == [2] * 14 + [4] * 140  # the last (odd) row forms 1 x 2 groups
+    torch.testing.assert_close((sizes.double() / 605).sum(), torch.tensor(1.0, dtype=torch.float64), rtol=0,
+                               atol=1e-15)  # the query weights w_a = |G_a| / n
+    for row, column in [(0, 0), (1, 1), (19, 27), (20, 0), (20, 27)]:  # patch (row, column) -> 2 x 2 block
+        assert groups[17 + row * 28 + column] == 17 + (row // 2) * 14 + column // 2
+
+
+def test_query_groups_of_an_odd_grid_and_without_patches():
+    assert sorted(torch.bincount(query_groups(1, (3, 3)))[1:].tolist()) == [1, 2, 2, 4]
+    assert query_groups(17, None).tolist() == list(range(17))
+
+
+def test_query_selector_matches_the_formula_on_a_hand_example():
+    """H=2, one special token and a 1 x 4 patch grid: groups {0}, {1, 2}, {3, 4} with weights 1/5, 2/5, 2/5."""
+    queries, keys = _random_qk(5, 7)
+    groups, weights = [[0], [1, 2], [3, 4]], [1 / 5, 2 / 5, 2 / 5]
+    expected = torch.zeros(7, dtype=torch.float64)
+    for h in range(2):
+        for group, weight in zip(groups, weights, strict=True):
+            q_bar = queries[0, h, group].mean(0)
+            logits = torch.stack([q_bar @ keys[0, h, j] for j in range(7)]) / 2**0.5
+            expected += weight * torch.softmax(logits, 0) / 2
+    got = select_query(_candidates(queries, keys, [1] * 7, list(range(7)), 1, grid_hw=(1, 4)))
+    torch.testing.assert_close(got, expected, rtol=0, atol=1e-14)
+
+
+def test_query_selector_needs_the_grid_of_a_layer_with_patches():
+    queries, keys = _random_qk(5, 7)
+    with pytest.raises(ValueError, match="grid"):
+        select_query(_candidates(queries, keys, [1] * 7, list(range(7)), 1, grid_hw=None))
+
+
+def test_xstream_rows_of_the_g3_frame():
+    rows = xstream_rows(17, 588)
+    sizes = torch.bincount(rows)
+    assert sizes.numel() == 17 + 37 and (sizes[:17] == 1).all()
+    assert sizes[17:].tolist() == [16] * 36 + [12]  # raster chunks of 16 patches, the remainder is one row
+
+
+def test_xstream_selector_matches_the_formula_on_a_hand_example():
+    """Two special rows, patches 0-15 in one row and the remaining 4 patches in another: mu is the row mean of
+    the head-mean pooled queries, and s_j = <mu, mean_h k_j>."""
+    queries, keys = _random_qk(22, 9, heads=3, dim=4)
+    rows = [[0], [1], list(range(2, 18)), list(range(18, 22))]
+    mu = torch.stack([queries[0, :, row].mean(1).mean(0) for row in rows]).mean(0)
+    expected = torch.stack([mu @ keys[0, :, j].mean(0) for j in range(9)])
+    got = select_xstream(_candidates(queries, keys, [1] * 9, list(range(9)), 2, grid_hw=(4, 5)))
+    torch.testing.assert_close(got, expected, rtol=0, atol=1e-14)
+
+
+def test_recency_selector_keeps_the_newest_rows():
+    frame_id, token_id = torch.tensor([2, 2, 3, 3, 4, 4]), torch.tensor([3, 2, 5, 4, 1, 0])
+    scores = select_recency(_candidates(None, None, frame_id, token_id, 1))
+    kept = top_rows(scores, frame_id, token_id, torch.ones(6, dtype=torch.bool), 3)
+    assert kept.tolist() == [5, 4, 3]  # frame 4 (tokens 0, 1), then frame 3 token 4
+
+
+def test_random_selector_is_keyed_by_layer_and_time():
+    def scores(layer_id, t):
+        return select_random(_candidates(None, None, [1] * 50, list(range(50)), 1, layer_id=layer_id, t=t))
+
+    assert torch.equal(scores(3, 7), scores(3, 7))
+    assert torch.equal(scores(3, 7), torch.from_numpy(np.random.default_rng([42, 3, 7]).random(50)))
+    assert not torch.equal(scores(3, 7), scores(4, 7)) and not torch.equal(scores(3, 7), scores(3, 8))
+
+
+def test_ties_go_to_the_newer_frame_then_the_smaller_token():
+    frame_id, token_id = torch.tensor([2, 3, 3, 2, 3]), torch.tensor([1, 4, 2, 0, 3])
+    equal = torch.zeros(5, dtype=torch.float64)
+    everything = torch.ones(5, dtype=torch.bool)
+    assert top_rows(equal, frame_id, token_id, everything, 4).tolist() == [2, 4, 1, 3]
+    assert top_frames(equal, frame_id, everything, 1).tolist() == [3]
+
+
+def test_long_special_frames_are_chosen_by_their_mean_score():
+    frame_id = torch.tensor([2, 2, 3, 3, 4, 4])
+    scores = torch.tensor([0.9, 0.0, 0.5, 0.5, 0.3, 0.3], dtype=torch.float64)  # means 0.45, 0.5, 0.3
+    everything = torch.ones(6, dtype=torch.bool)
+    assert top_frames(scores, frame_id, everything, 2).tolist() == [3, 2]
+    assert top_rows(scores, frame_id, frame_id, everything, 1).tolist() == [0]  # per token, 0.9 wins
+
+
+def test_query_selector_keeps_the_patches_the_current_queries_attend_to():
+    """The patches of frame 2 align with every query, so a query-guided long-patch store keeps them over the
+    newer frame 3 (which recency would keep)."""
+    policy = CachePolicy(recent=1, long_special=1, long_patch=4, selector="query")
+    cache = LayerKVCache(policy, N, M, torch.float64, layer_id=0)
+    for t in range(1, 5):
+        k, v = _frame_kv(t, N)
+        k = 0.01 * k
+        if t == 2:
+            k[:, :, M:] = 10.0  # every channel aligned with the all-ones queries
+        cache.append(k, v, t)
+        cache.commit(_queries(N), t, grid_hw=(2, 2))
+        assert cache.invariants()["ok"]
+    rows = _rows(cache)
+    assert [(2, j) for j in range(M, N)] == [row for row in rows if row[0] == 2 and row[1] >= M]
+    assert not [row for row in rows if row[0] == 3 and row[1] >= M]
+
+
+@pytest.mark.parametrize("selector", SELECTOR_NAMES)
+def test_every_selector_streams_within_budget(selector):
+    policy = CachePolicy(recent=1, long_special=2, long_patch=3, selector=selector)
+    cache = LayerKVCache(policy, N, M, torch.float64, layer_id=1)
+    for t in range(1, 9):
+        k, v = _frame_kv(t, N)
+        cache.append(k + torch.randn(k.shape, generator=torch.Generator().manual_seed(t), dtype=k.dtype), v, t)
+        cache.commit(_queries(N), t, grid_hw=(2, 2))
+        assert cache.invariants()["ok"] and cache.size <= 19

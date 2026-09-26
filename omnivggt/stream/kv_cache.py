@@ -17,14 +17,18 @@ The long-term stores are selected at the commit, from every candidate of the wri
 selector; ties go to the newer frame, then to the smaller token id.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 from torch import Tensor
 
 SELECTOR_NAMES = ("query", "xstream", "recency", "random")
 QUANT_NAMES = ("int8", "int4")
+XSTREAM_POOL = 16  # patch queries per pooled row of XStreamVGGT's score
+RANDOM_SEED = 42
 
 
 def _is_int(value) -> bool:
@@ -113,12 +117,77 @@ class Candidates:
     t: int
 
 
+def query_groups(special_count: int, grid_hw: Optional[Tuple[int, int]]) -> Tensor:
+    """Query group of every token of a frame ([n] int64): each special token alone, then the patches (raster
+    order) in 2 x 2 blocks of the grid; an odd last row or column gives 1 x 2, 2 x 1 or 1 x 1 blocks."""
+    special = torch.arange(special_count)
+    if grid_hw is None:
+        return special
+    rows, columns = grid_hw
+    blocks = torch.arange(rows)[:, None] // 2 * ((columns + 1) // 2) + torch.arange(columns)[None, :] // 2
+    return torch.cat([special, special_count + blocks.reshape(-1)])
+
+
+def xstream_rows(special_count: int, patch_count: int) -> Tensor:
+    """XStreamVGGT's pooled query rows of every token ([n] int64): each special token alone, then the patches in
+    raster chunks of ``XSTREAM_POOL`` (the remainder is one more row)."""
+    return torch.cat([torch.arange(special_count), special_count + torch.arange(patch_count) // XSTREAM_POOL])
+
+
+def _pooled_queries(queries: Tensor, groups: Tensor) -> Tuple[Tensor, Tensor]:
+    """Mean query of every group ([1, H, G, D]) and the group sizes ([G])."""
+    if groups.numel() != queries.shape[2]:
+        raise ValueError(f"{groups.numel()} grouped tokens for {queries.shape[2]} queries: check grid_hw")
+    groups = groups.to(queries.device)
+    sizes = torch.bincount(groups).to(queries.dtype)
+    sums = queries.new_zeros(*queries.shape[:2], sizes.numel(), queries.shape[3]).index_add_(2, groups, queries)
+    return sums / sizes[:, None], sizes
+
+
+def _score_dtype(candidates: Candidates) -> torch.dtype:
+    return torch.promote_types(candidates.keys.dtype, torch.float32)
+
+
+def select_query(candidates: Candidates) -> Tensor:
+    """Query-guided importance of every row (design doc §5): s_j = (1/H) sum_h sum_a w_a alpha_{h,a,j}.
+
+    The current queries are pooled per ``query_groups`` (mean q_{h,a}, weight w_a = |G_a| / n) and alpha_{h,a,.}
+    = softmax_j(q_{h,a} . k_{h,j} / sqrt(d)) over every row of the written cache.
+    """
+    queries, keys = candidates.queries, candidates.keys
+    has_patches = queries.shape[2] > candidates.special_count
+    if has_patches and candidates.grid_hw is None:
+        raise ValueError("the query selector groups the patch queries on the grid: grid_hw is needed")
+    dtype = _score_dtype(candidates)
+    pooled, sizes = _pooled_queries(queries.to(dtype), query_groups(candidates.special_count, candidates.grid_hw))
+    logits = pooled @ keys.to(dtype).transpose(-2, -1) / math.sqrt(queries.shape[3])  # [1, H, G, N]
+    weights = sizes / queries.shape[2]
+    return (logits.softmax(dim=-1) * weights[:, None]).sum(dim=2).mean(dim=1)[0]
+
+
+def select_xstream(candidates: Candidates) -> Tensor:
+    """XStreamVGGT's rank-1 score of every row: s_j = <mu, mean_h k_j>, mu the mean over the pooled query rows
+    (``xstream_rows``) of their head-mean queries. Only the score is XStreamVGGT's, not its cache policy."""
+    queries = candidates.queries
+    dtype = _score_dtype(candidates)
+    patch_count = queries.shape[2] - candidates.special_count
+    pooled, _ = _pooled_queries(queries.to(dtype), xstream_rows(candidates.special_count, patch_count))
+    mu = pooled.mean(dim=1).mean(dim=1)  # [1, D]: mean over heads, then over rows
+    return (candidates.keys.to(dtype).mean(dim=1) @ mu[0])[0]
+
+
 def select_recency(candidates: Candidates) -> Tensor:
     """Importance of every row (higher is kept first): the newer frame (ties: the smaller token id)."""
     return candidates.frame_id.double()
 
 
-SELECTORS = {"recency": select_recency}
+def select_random(candidates: Candidates) -> Tensor:
+    """Random importance of every row, from ``numpy.random.default_rng([42, layer_id, t])``."""
+    generator = np.random.default_rng([RANDOM_SEED, candidates.layer_id, candidates.t])
+    return torch.from_numpy(generator.random(candidates.frame_id.numel())).to(candidates.frame_id.device)
+
+
+SELECTORS = {"query": select_query, "xstream": select_xstream, "recency": select_recency, "random": select_random}
 
 
 def _ranked(scores: Tensor, frame_id: Tensor, token_id: Tensor) -> Tensor:
@@ -157,8 +226,6 @@ class LayerKVCache:
             raise ValueError(f"need 1 <= special_count <= tokens_per_frame, got {special_count}, {tokens_per_frame}")
         if initial_frames < 1:
             raise ValueError(f"initial_frames must be positive, got {initial_frames}")
-        if policy.selector is not None and policy.selector not in SELECTORS:
-            raise NotImplementedError(f"selector {policy.selector!r} is not implemented")
         if policy.quant is not None:
             raise NotImplementedError("quantisation is not implemented")
         self.policy = policy
