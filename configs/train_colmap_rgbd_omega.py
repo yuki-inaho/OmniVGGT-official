@@ -23,6 +23,12 @@
 #   OMNIVGGT_GRAD_ACCUM           micro-batches per optimizer step (default: 1)
 #   OMNIVGGT_INIT_CHECKPOINT      trained OmniVGGTOmega checkpoint of the same variant to start from (default: none)
 #   OMNIVGGT_CAM_DROP_PROB        probability of hiding the camera input from a whole sample (default: 0.1)
+#   OMNIVGGT_KEEP_BEST            checkpoints kept besides final_checkpoint: the k with the lowest smoke-split objective
+#                                 (final_checkpoint counts towards k; the latest one also stays while training runs;
+#                                 checkpoints.json in the run directory records every score); 0 keeps
+#                                 final_checkpoint only (default: 1). The last epoch is saved as final_checkpoint only.
+#   OMNIVGGT_VAL_SAMPLES          training steps of the smoke split (fixed samples, no augmentation) that score every
+#                                 checkpoint (default: 16); the val split is left for the confirmation
 # Stream-Omega (frame-causal) training; each option is independent of the others:
 #   OMNIVGGT_CAUSAL               1 trains frame-causal inter-frame attention, needs CAM_DROP_PROB=1 (default: 0)
 #   OMNIVGGT_DEPTH_NORM           joint (all views with depth) or first_frame depth-input normalization (default: joint)
@@ -79,6 +85,14 @@ if not 0 <= cam_drop_prob <= 1:
 depth_drop_prob = float("{{$OMNIVGGT_DEPTH_DROP_PROB:0.3}}")
 depth_all_views = bool(int("{{$OMNIVGGT_DEPTH_ALL_VIEWS:0}}"))
 save_each_epoch = True
+_keep_best = "{{$OMNIVGGT_KEEP_BEST:1}}"
+if not _keep_best.isdigit():
+    raise ValueError(f"OMNIVGGT_KEEP_BEST must be a non-negative integer, got {_keep_best!r}")
+keep_best = int(_keep_best)
+_val_samples = "{{$OMNIVGGT_VAL_SAMPLES:16}}"
+if not (_val_samples.isdigit() and int(_val_samples) > 0):
+    raise ValueError(f"OMNIVGGT_VAL_SAMPLES must be a positive integer, got {_val_samples!r}")
+val_samples = int(_val_samples)
 patch_embed_freeze = bool(int("{{$OMNIVGGT_PATCH_EMBED_FREEZE:0}}"))
 
 # == Stream-Omega (frame-causal) Configuration ==

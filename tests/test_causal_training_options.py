@@ -175,10 +175,12 @@ TRAIN, VAL = 50, 12  # frames per scene: train 0..49, guard 50..51, val 52..63
 SCENES = ("scene_000000", "scene_000001")
 
 
-def _write_scene(scene, rng, train_frames=TRAIN, val_frames=VAL):
+def _write_scene(scene, rng, train_frames=TRAIN, val_frames=VAL, smoke_frames=0):
+    """train 0..T-1, guard T..T+1, val T+2..; with ``smoke_frames``, a guard of 2 then the smoke frames."""
     (scene / "rgb").mkdir(parents=True)
     (scene / "depth").mkdir()
-    frames = train_frames + 2 + val_frames
+    val_end = train_frames + 2 + val_frames
+    frames = val_end + (2 + smoke_frames if smoke_frames else 0)
     k = np.array([[60.0, 0, W / 2], [0, 60.0, H / 2], [0, 0, 1]], dtype=np.float32)
     w2c = np.zeros((frames, 3, 4), dtype=np.float32)
     for index in range(frames):
@@ -189,12 +191,14 @@ def _write_scene(scene, rng, train_frames=TRAIN, val_frames=VAL):
         depth[:4] = 0
         Image.fromarray(depth).save(scene / "depth" / f"frame_{index:06d}.png")
     np.savez_compressed(scene / "cameras.npz", intrinsics=np.repeat(k[None], frames, 0), extrinsics_w2c=w2c)
-    train, val = np.arange(train_frames).reshape(-1, 10), np.arange(train_frames + 2, frames).reshape(-1, 6)
+    train, val = np.arange(train_frames).reshape(-1, 10), np.arange(train_frames + 2, val_end).reshape(-1, 6)
+    smoke = np.array_split(np.arange(val_end + 2, frames), -(-smoke_frames // 10)) if smoke_frames else []
     np.savez_compressed(
         scene / "sequences.npz",  # sequences padded with -1 to length 10
-        sequences=np.concatenate([train, np.pad(val, ((0, 0), (0, 4)), constant_values=-1)]),
-        lengths=np.array([10] * len(train) + [6] * len(val)),
-        split_ids=np.array([0] * len(train) + [1] * len(val)),
+        sequences=np.concatenate([train, np.pad(val, ((0, 0), (0, 4)), constant_values=-1),
+                                  *[np.pad(s, (0, 10 - len(s)), constant_values=-1)[None] for s in smoke]]),
+        lengths=np.array([10] * len(train) + [6] * len(val) + [len(s) for s in smoke]),
+        split_ids=np.array([0] * len(train) + [1] * len(val) + [2] * len(smoke)),
     )
 
 

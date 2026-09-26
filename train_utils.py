@@ -12,12 +12,16 @@ License: MIT
 """
 
 import os
+import re
 import json
 import math
+import random
+import shutil
 import logging
+import contextlib
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import wandb
@@ -29,12 +33,15 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
 from accelerate.logging import get_logger
+from accelerate.utils import send_to_device
 
 from omnivggt.loss import MultitaskLoss
 from omnivggt.models.omnivggt import OmniVGGT
 from omnivggt.models.omnivggt_omega import OmniVGGTOmega
 from omnivggt.utils import weight_transfer
+from omnivggt.utils.normalization import normalize_camera_extrinsics_and_points_batch
 from omnivggt.datasets import get_data_loader
+from omnivggt.datasets.utils.misc import merge_dicts
 
 logger = get_logger(__name__, log_level="INFO")
 
@@ -468,6 +475,223 @@ def evaluation_weights(optimizer: torch.optim.Optimizer):
     finally:
         if was_training:
             optimizer.train()
+
+
+@contextmanager
+def evaluation_mode(model: torch.nn.Module):
+    """Run the block with every module of ``model`` in eval mode; afterwards each module is back in its own mode."""
+    modes = [(module, module.training) for module in model.modules()]
+    model.eval()
+    try:
+        yield
+    finally:
+        for module, training in modes:
+            module.training = training
+
+
+@contextmanager
+def isolated_rng():
+    """Run the block with the random states of Python, NumPy, torch (CPU) and every CUDA device restored afterwards,
+    so that what the block draws (e.g. a validation pass) leaves the draws after it, and the training run, unchanged."""
+    python_state, numpy_state, torch_state = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+# == k-best checkpoints ==
+
+CHECKPOINTS_FILE = "checkpoints.json"
+SMOKE_SPLIT = "smoke"  # the selection data; val is kept for the confirmation of the chosen checkpoint
+VALIDATION_PROGRESS = 1.0  # the loss of every checkpoint is the end-of-training objective (e.g. predicted intrinsics)
+
+
+def _rank(entry: dict) -> Tuple[bool, float, int]:
+    """Sort key: lower score first, a non-finite score after every finite one; ties: the earlier step first."""
+    score = entry["score"]
+    finite = math.isfinite(score)
+    return not finite, score if finite else 0.0, entry["step"]
+
+
+class CheckpointKeeper:
+    """Keeps the ``keep_best`` checkpoints of a run with the lowest score, and deletes the other checkpoint
+    directories it recorded.
+
+    ``record`` a checkpoint once its directory ``save_dir/name`` is written: while the run trains, the ``keep_best``
+    best recorded checkpoints (ties: the earlier step) and the most recent one (to resume from) stay. ``finalize``
+    with the final checkpoint, which always stays and counts towards ``keep_best``: afterwards only the final
+    checkpoint and those among the ``keep_best`` best of all (the final one included) remain.
+
+    Only directories recorded here are ever deleted (never the final checkpoint, nor any other file or directory of
+    ``save_dir``); one missing at deletion is an error. ``save_dir/checkpoints.json`` is the audit trail: every
+    recorded checkpoint (name, step, score, extra) with the checkpoints kept and removed after it. A keeper built on
+    a ``save_dir`` holding one continues it (a resumed run).
+    """
+
+    def __init__(self, save_dir, keep_best: int):
+        if isinstance(keep_best, bool) or not isinstance(keep_best, int) or keep_best < 0:
+            raise ValueError(f"keep_best must be a non-negative integer, got {keep_best!r}")
+        self.save_dir = Path(save_dir)
+        self.keep_best = keep_best
+        self.path = self.save_dir / CHECKPOINTS_FILE
+        self.entries: List[dict] = []
+        self._live: Dict[str, dict] = {}  # recorded and not removed, in recording order
+        self.finalized = False
+        if self.path.exists():
+            self._resume(json.loads(self.path.read_text()))
+
+    @property
+    def kept(self) -> List[str]:
+        """Names of the recorded checkpoints that are still on disk, in recording order."""
+        return list(self._live)
+
+    def record(self, name: str, score: float, step: int, extra: Optional[dict] = None) -> dict:
+        """Record the written checkpoint ``name``; delete the recorded ones neither among the best nor the latest."""
+        return self._record(name, score, step, extra, final=False)
+
+    def finalize(self, final_name: str, score: float, step: int, extra: Optional[dict] = None) -> dict:
+        """Record the final checkpoint; delete the recorded ones not among the best of all (the final one included)."""
+        return self._record(final_name, score, step, extra, final=True)
+
+    def _resume(self, audit: dict) -> None:
+        if audit.get("finalized"):
+            raise ValueError(f"{self.path} records a finished run: start a new run in a new output directory")
+        for entry in audit["checkpoints"]:
+            self._live.pop(entry["name"], None)
+            self._live[entry["name"]] = entry
+            for name in entry["removed"]:
+                del self._live[name]
+        self.entries = list(audit["checkpoints"])
+        for name in self._live:
+            if not self._directory(name).is_dir():
+                raise FileNotFoundError(f"{self.path} keeps checkpoint {name!r}, which is not in {self.save_dir}")
+
+    def _directory(self, name: str) -> Path:
+        if not isinstance(name, str) or name in ("", ".", "..") or Path(name).name != name or os.sep in name:
+            raise ValueError(f"a checkpoint is one directory inside {self.save_dir}, got {name!r}")
+        return self.save_dir / name
+
+    def _record(self, name: str, score: float, step: int, extra: Optional[dict], final: bool) -> dict:
+        if self.finalized:
+            raise RuntimeError(f"the final checkpoint is recorded: no checkpoint follows it ({name!r})")
+        directory = self._directory(name)
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ValueError(f"a checkpoint is one real directory inside {self.save_dir}, got {name!r}")
+        if not directory.is_dir():
+            raise FileNotFoundError(f"checkpoint {name!r} is recorded after it is written to {directory}")
+        entry = {"name": name, "step": int(step), "score": float(score), "final": final,
+                 "keep_best": self.keep_best, "extra": dict(extra or {})}
+        live = {key: value for key, value in self._live.items() if key != name}  # a rewritten name replaces its entry
+        live[name] = entry
+        # the best ones among the recorded checkpoints on disk (the final one included), and the one recorded now:
+        # the latest while the run trains, or the final one
+        keep = {value["name"] for value in sorted(live.values(), key=_rank)[:self.keep_best]} | {name}
+        removed = [key for key in live if key not in keep]
+        for key in removed:  # check every directory first: nothing is deleted when one is missing
+            if not self._directory(key).is_dir() or self._directory(key).is_symlink():
+                raise FileNotFoundError(f"recorded checkpoint {key!r} is not a directory in {self.save_dir}")
+        for key in removed:
+            shutil.rmtree(self._directory(key))
+            del live[key]
+        entry.update(kept=list(live), removed=removed)
+        self._live, self.finalized = live, final
+        self.entries.append(entry)
+        self._write()
+        return entry
+
+    def _write(self) -> None:
+        audit = {"keep_best": self.keep_best, "order": "lower score is better; ties: the earlier step",
+                 "finalized": self.finalized, "checkpoints": self.entries}
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        temporary.write_text(json.dumps(audit, indent=1) + "\n")
+        os.replace(temporary, self.path)
+
+
+def smoke_split_spec(train_spec: str, samples: int) -> str:
+    """The dataset spec of the selection data of a run: ``samples`` samples of the smoke split, drawn like those of
+    ``train_spec`` (one ``N @ ColmapRgbd(..., split='train', ...)``: the same roots, views, resolution and sample seed)
+    without augmentation (``aug_crop=0``, ``transform=ImgNorm``)."""
+    if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
+        raise ValueError(f"the smoke split needs a positive number of samples, got {samples!r}")
+    match = re.fullmatch(r"\s*\d[\d_]*\s*@\s*(ColmapRgbd\(.*\))\s*", train_spec, flags=re.S)
+    body = match.group(1) if match else ""
+    replacements = ((r"split\s*=\s*'train'", "split='smoke'"), (r"aug_crop\s*=\s*\d+", "aug_crop=0"),
+                    (r"transform\s*=\s*\w+", "transform=ImgNorm"))
+    for pattern, replacement in replacements:
+        body, count = re.subn(pattern, replacement, body)
+        if count != 1:
+            raise ValueError(f"the smoke split is derived from one 'N @ ColmapRgbd(..., split='train', aug_crop=.., "
+                             f"transform=..)' train_dataset, got {train_spec!r}")
+    return f"{samples} @ {body}"
+
+
+def build_validation_loader(cfg: Any) -> torch.utils.data.DataLoader:
+    """The selection data of a batch-trainer run (train_omnivggt.py): ``cfg.val_samples`` training steps of the smoke
+    split (``smoke_split_spec`` of ``cfg.train_dataset``), always the same samples in the same order."""
+    spec = smoke_split_spec(cfg.get("train_dataset"), cfg.get("val_samples", 16))
+    try:
+        loader = get_data_loader(spec, batch_size=cfg.get("train_batch_images", 24), num_workers=cfg.get("num_workers", 8),
+                                 shuffle=False, drop_last=False, full_clips=cfg.get("full_clips", False))
+    except ValueError as err:
+        raise ValueError(f"keep_best scores the checkpoints on the smoke split, which cannot be read: {err}") from err
+    loader.dataset.set_epoch(0)  # fixed samples (the ResizedDataset draw) and order (the sampler draw)
+    loader.sampler.set_epoch(0)
+    logger.info(f"Validation (checkpoint selection) data: {len(loader)} steps of {spec}")
+    return loader
+
+
+def split_batch(batch: dict, target_scale: str) -> Tuple[dict, dict]:
+    """(model inputs, loss targets) of a merged training batch: the targets hold the camera, points and depth
+    normalised as the loss expects them; the inputs keep the raw ones."""
+    new_extrinsics, _, new_world_points, new_depths = normalize_camera_extrinsics_and_points_batch(
+        extrinsics=batch['extrinsic'],
+        cam_points=None,
+        world_points=batch['world_points'],
+        depths=batch['depth'],
+        point_masks=batch['valid_mask'],
+        target_scale=target_scale,
+    )
+    inputs = {
+        'images': batch['images'],
+        'extrinsics': batch['extrinsic'].clone(),
+        'intrinsics': batch['intrinsic'],
+        'depth': batch['depth'].clone(),
+        'mask': batch['valid_mask'].clone(),
+    }
+    targets = {**batch, 'extrinsic': new_extrinsics, 'world_points': new_world_points, 'depth': new_depths}
+    return inputs, targets
+
+
+def validation_modality_rng(seed: int, index: int) -> np.random.Generator:
+    """Generator of the auxiliary camera/depth views of validation step ``index``: the same for every checkpoint,
+    and keyed apart from the training draws (``modality_rng``)."""
+    return np.random.default_rng([int(seed), int(index)])
+
+
+def validation_objective(model: torch.nn.Module, loader, criterion: Callable, target_scale: str, seed: int,
+                         device, autocast: Callable = contextlib.nullcontext) -> Dict[str, float]:
+    """Mean of every loss term over the steps of ``loader`` (the smoke split), computed as in training (``split_batch``,
+    the forward under ``autocast``, the loss without it) at ``VALIDATION_PROGRESS``, without gradients, with the
+    model in eval mode and every random state restored afterwards: the training run continues as without it."""
+    terms = []
+    device = torch.device(device)
+    with isolated_rng(), evaluation_mode(model), torch.no_grad():
+        for index, batch in enumerate(loader):
+            inputs, targets = split_batch(send_to_device(merge_dicts(batch), device), target_scale=target_scale)
+            with autocast():
+                predictions = model(**inputs, modality_rng=validation_modality_rng(seed, index))
+            with torch.autocast(device.type, enabled=False):
+                loss = criterion(predictions, targets, progress=VALIDATION_PROGRESS)
+            terms.append({key: float(value) for key, value in loss.items()})
+    if not terms:
+        raise ValueError("the validation loader is empty")
+    return {key: float(np.mean([term[key] for term in terms])) for key in terms[0]}
 
 
 def build_optimizer(model: torch.nn.Module, cfg: Any) -> torch.optim.Optimizer:

@@ -18,14 +18,17 @@ from omnivggt.utils.configs import parse_configs
 from omnivggt.datasets import get_data_loader
 from omnivggt.datasets.utils.misc import merge_dicts
 from omnivggt.utils.misc import select_first_batch
-from omnivggt.utils.normalization import normalize_camera_extrinsics_and_points_batch
 from visual_util import (
     predictions_to_glb,
     get_world_points_from_depth,
 )
 from train_utils import (
+    VALIDATION_PROGRESS,
+    CheckpointKeeper,
+    build_validation_loader,
     configure_schedule,
     evaluation_weights,
+    isolated_rng,
     setup_logging,
     setup_directories,
     setup_wandb,
@@ -37,7 +40,9 @@ from train_utils import (
     optimizer_steps_per_epoch,
     resume_position,
     resume_skip,
+    split_batch,
     start_epoch,
+    validation_objective,
 )
 
 logger = get_logger(__name__, log_level="INFO")
@@ -137,7 +142,44 @@ if __name__ == '__main__':
     lr_scheduler = configure_schedule(optimizer, cfg, total_training_steps)  # None for schedule-free AMUSE
     if lr_scheduler is not None:
         accelerator.register_for_checkpointing(lr_scheduler)
-    
+
+    # k-best checkpoints (keep_best, main process): every checkpoint is scored on fixed smoke-split samples and only
+    # the best ones, the latest one while training runs, and final_checkpoint stay (checkpoints.json records them).
+    # Without keep_best in the config every checkpoint stays and none is scored.
+    keep_best = cfg.get("keep_best")
+    keeper = validation_loader = None
+    if keep_best is not None and accelerator.is_main_process:
+        with isolated_rng():  # the training run draws as without validation
+            validation_loader = build_validation_loader(cfg)  # fails here, before training, without a smoke split
+        keeper = CheckpointKeeper(save_dir, keep_best)
+        logger.info(f"k-best checkpoints: keep_best={keep_best}, recorded checkpoints kept so far: {keeper.kept}")
+
+    def save_checkpoint(name: str, step: int, final: bool = False) -> None:
+        """Save the evaluation weights (AMUSE: the averaged x) as save_dir/name; with keep_best, score these same
+        weights on the smoke split, then keep the best checkpoints."""
+        save_path = os.path.join(save_dir, name)
+        logger.info(f"Saving checkpoint to {save_path}...")
+        with evaluation_weights(optimizer):  # AMUSE: save (and score) the averaged (evaluation) weights
+            accelerator.save_state(save_path)
+            if keeper is None:
+                return
+            score = validation_objective(accelerator.unwrap_model(model), validation_loader, train_criterion,
+                                         target_scale=target_scale, seed=cfg.get("seed", 42),
+                                         device=accelerator.device, autocast=accelerator.autocast)
+        extra = {"split": "smoke", "samples": cfg.get("val_samples", 16), "progress": VALIDATION_PROGRESS,
+                 "components": score}
+        if final:
+            entry = keeper.finalize(name, score["objective"], step, extra=extra)
+        else:
+            entry = keeper.record(name, score["objective"], step, extra=extra)
+        logger.info(f"{name}: smoke-split objective {score['objective']:.6f} at step {step}; "
+                    f"kept {entry['kept']}, removed {entry['removed']}")
+        if writer is not None:
+            writer.add_scalar("val/objective", score["objective"], step)
+            for key, value in score.items():
+                if key != "objective":
+                    writer.add_scalar(f"val/{key}", value, step)
+
     # ======================================================
     # 5. Resume from Checkpoint (if specified)
     # ======================================================
@@ -222,34 +264,10 @@ if __name__ == '__main__':
         for step, batch in enumerate(train_iter, start=skip_micro_batches):
             batch = merge_dicts(batch)
             
-            # Normalize camera extrinsics and points for loss computation
-            new_extrinsics, _, new_world_points, new_depths = normalize_camera_extrinsics_and_points_batch(
-                extrinsics=batch['extrinsic'],
-                cam_points=None,
-                world_points=batch['world_points'],
-                depths=batch['depth'],
-                point_masks=batch['valid_mask'],
-                target_scale=target_scale,
-            )
-            
-            # Store original inputs for model
-            input_extrinsics = batch['extrinsic'].clone()
-            input_depths = batch['depth'].clone()
-            input_mask = batch['valid_mask'].clone()
-            
-            # Update batch with normalized values for loss computation
-            batch['extrinsic'] = new_extrinsics
-            batch['world_points'] = new_world_points
-            batch['depth'] = new_depths
+            # Model inputs (raw camera and depth) and loss targets (normalised camera, points and depth)
+            inputs, batch = split_batch(batch, target_scale=target_scale)
             
             # Forward pass
-            inputs = {
-                'images': batch['images'],
-                'extrinsics': input_extrinsics,
-                'intrinsics': batch['intrinsic'],
-                'depth': input_depths,
-                'mask': input_mask
-            }
             predictions = model(**inputs, modality_rng=modality_rng(cfg.get("seed", 42), accelerator.process_index,
                                                                     epoch, step))
             
@@ -335,11 +353,8 @@ if __name__ == '__main__':
                 if accelerator.is_main_process and global_step % cfg.get("checkpointing_steps", 10000) == 0:
                     # Calculate completed epochs based on global_step
                     completed_epochs = global_step // local_steps_per_epoch
-                    save_path = os.path.join(save_dir, f"checkpoint-{completed_epochs}-{global_step}")
-                    logger.info(f"Saving checkpoint to {save_path}...")
-                    with evaluation_weights(optimizer):  # AMUSE: save the averaged (evaluation) weights
-                        accelerator.save_state(save_path)
-                    logger.info(f"Checkpoint saved successfully")
+                    save_checkpoint(f"checkpoint-{completed_epochs}-{global_step}", global_step)
+                    logger.info("Checkpoint saved successfully")
         
         progress_bar.close()
         
@@ -357,11 +372,10 @@ if __name__ == '__main__':
         logger.info(f"Epoch {epoch + 1} completed - Global step: {global_step}")
         logger.info("=" * 60)
         
-        if accelerator.is_main_process and cfg.get("save_each_epoch", True):
-            epoch_save_path = os.path.join(save_dir, f"checkpoint-epoch-{epoch + 1}")
-            logger.info(f"Saving end-of-epoch checkpoint to {epoch_save_path}...")
-            with evaluation_weights(optimizer):  # AMUSE: save the averaged (evaluation) weights
-                accelerator.save_state(epoch_save_path)
+        # the last epoch is saved as final_checkpoint only (its checkpoint-epoch-N would be the same weights)
+        if accelerator.is_main_process and cfg.get("save_each_epoch", True) and epoch + 1 < cfg.get("num_train_epochs"):
+            logger.info(f"Saving end-of-epoch checkpoint {epoch + 1}...")
+            save_checkpoint(f"checkpoint-epoch-{epoch + 1}", global_step)
         
         gc.collect()
         torch.cuda.empty_cache()
@@ -372,10 +386,7 @@ if __name__ == '__main__':
     logger.info("=" * 60)
     
     if accelerator.is_main_process:
-        final_save_path = os.path.join(save_dir, "final_checkpoint")
-        logger.info(f"Saving final checkpoint to {final_save_path}...")
-        with evaluation_weights(optimizer):  # AMUSE: save the averaged (evaluation) weights
-            accelerator.save_state(final_save_path)
+        save_checkpoint("final_checkpoint", global_step, final=True)
         logger.info("Final checkpoint saved successfully")
         
         if cfg.get("wandb", False):

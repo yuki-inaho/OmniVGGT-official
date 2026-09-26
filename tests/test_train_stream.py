@@ -25,7 +25,7 @@ from omnivggt.utils.normalization import normalize_camera_extrinsics_and_points_
 
 REPO = Path(__file__).resolve().parents[1]
 CONFIG = REPO / "configs" / "train_colmap_rgbd_omega.py"
-TRAIN_FRAMES, VAL_FRAMES = 100, 12  # per scene: train 0..99, guard 100..101, val 102..113
+TRAIN_FRAMES, VAL_FRAMES, SMOKE_FRAMES = 100, 12, 26  # per scene: train 0..99, val 102..113, smoke 116..141
 T_X_RECIPE = {  # the environment of temp/stream_omega/train_tx.sh, at the staging image size
     "OMNIVGGT_OMEGA_VARIANT": "configs/omnivggt_omega/variants/V5.json", "OMNIVGGT_OPTIMIZER": "amuse",
     "OMNIVGGT_DEPTH_ALL_VIEWS": "1", "OMNIVGGT_DEPTH_DROP_PROB": "0", "OMNIVGGT_CAM_DROP_PROB": "1",
@@ -49,7 +49,8 @@ def staging(tmp_path_factory):
     root = tmp_path_factory.mktemp("staging")
     rng = np.random.default_rng(0)
     for name in SCENES:
-        _write_scene(root / "scenes" / name, rng, train_frames=TRAIN_FRAMES, val_frames=VAL_FRAMES)
+        _write_scene(root / "scenes" / name, rng, train_frames=TRAIN_FRAMES, val_frames=VAL_FRAMES,
+                     smoke_frames=SMOKE_FRAMES)
     meta = {"format": "colmap_rgbd_v1", "depth": {"unit": "millimeters", "invalid_value": 0},
             "camera": {"extrinsics": "opencv_world_to_camera"}}
     (root / "dataset.json").write_text(json.dumps(meta))
@@ -334,12 +335,11 @@ def test_a_run_starts_from_the_init_checkpoint_and_saves_evaluation_checkpoints(
     recipe()
     init, state = _init_checkpoint(tmp_path)
     output = tmp_path / "stream_TX"
-    assert train_stream.main(_arguments(init, output)) == 0
+    assert train_stream.main(_arguments(init, output, "--keep-best", "2")) == 0  # both checkpoints stay
     report = json.loads((output / "weight_transfer_report.json").read_text())
     assert report["init_checkpoint"]["sha256"] == train_utils.weight_transfer.sha256_of(init / "model.safetensors")
     run = output / "omnivggt-omega-colmap-rgbd"
-    assert sorted(path.name for path in run.iterdir() if path.name.startswith(("checkpoint", "final"))) == [
-        "checkpoint-u1", "final_checkpoint"]
+    assert sorted(_checkpoint_names(run)) == ["checkpoint-u1", "final_checkpoint"]
     final = load_file(run / "final_checkpoint" / "model.safetensors")
     model = OmniVGGTOmega(**TINY, causal=True, depth_norm="first_frame")
     model.load_state_dict(final, strict=True)  # loads as an evaluation checkpoint
@@ -361,6 +361,8 @@ def test_a_run_starts_from_the_init_checkpoint_and_saves_evaluation_checkpoints(
     ({"OMNIVGGT_INIT_CHECKPOINT": "/elsewhere/final_checkpoint"}, (), "--init"),
     ({}, ("--updates", "3", "--window-length", "24"), "multiple"),
     ({}, ("--window-length", "18"), "multiple of 12"),
+    ({}, ("--keep-best", "-1"), "--keep-best"),
+    ({}, ("--val-windows", "0"), "--val-windows"),
 ])
 def test_a_run_refuses_another_recipe(recipe, tiny_build, tmp_path, env, extra, match):
     recipe(**env)
@@ -394,3 +396,128 @@ def _draw(window):
 def test_invalid_data_seeds_are_rejected(recipe, seed):
     with pytest.raises(ValueError, match="OMNIVGGT_DATA_SEED"):
         recipe(OMNIVGGT_DATA_SEED=seed)
+
+
+# --- k-best checkpoints: the smoke-split score -----------------------------------------------------------------------
+
+
+def _staging_without_smoke(root):
+    rng = np.random.default_rng(0)
+    for name in SCENES:
+        _write_scene(root / "scenes" / name, rng, train_frames=TRAIN_FRAMES, val_frames=VAL_FRAMES)
+    (root / "dataset.json").write_text(json.dumps({
+        "format": "colmap_rgbd_v1", "depth": {"unit": "millimeters", "invalid_value": 0},
+        "camera": {"extrinsics": "opencv_world_to_camera"}}))
+    return root
+
+
+def test_validation_windows_are_fixed_smoke_windows_at_the_smallest_stride(recipe):
+    cfg = recipe()  # strides 1 and 2: 24 views 2 apart do not fit in the 26 smoke frames of a scene
+    runs = []
+    for seed in (0, 1):
+        torch.manual_seed(seed)  # no colour jitter: the windows do not depend on torch's generator
+        runs.append(train_stream.validation_windows(cfg, 4, 24))
+    windows = runs[0]
+    assert len(windows) == 4
+    for window in windows:
+        frames = _frame_numbers(window["instance"])
+        assert len(frames) == 24 and set(np.diff(frames).tolist()) == {1}, frames
+        assert 116 <= frames[0] and frames[-1] <= 141  # smoke frames only
+        assert window["images"].shape == (1, 24, 3, 42, 56)
+    assert len({window["label"][0] for window in windows}) == len(SCENES)  # evenly spaced over the scenes
+    for first, second in zip(*runs, strict=True):
+        assert first["instance"] == second["instance"]
+        for key in TENSORS:
+            assert torch.equal(first[key], second[key]), key
+
+
+def test_validation_needs_smoke_windows_of_the_window_length(recipe, tmp_path):
+    with pytest.raises(ValueError, match="smoke"):
+        train_stream.validation_windows(recipe(), 4, 48)  # longer than the smoke frames of a scene
+    cfg = recipe(OMNIVGGT_COLMAP_RGBD_ROOTS=str(_staging_without_smoke(tmp_path / "no_smoke")))
+    with pytest.raises(ValueError, match="smoke"):
+        train_stream.validation_windows(cfg, 4, 12)
+
+
+def test_evaluate_window_is_the_mean_stream_loss_without_gradients_or_updates(recipe):
+    cfg = _fp64(recipe())
+    inputs, targets = _window(cfg, length=12)
+    model = _tiny_model()
+    trainer = train_stream.StreamTrainer(model, POLICY, cfg, updates=4)
+    reference, frames = StreamingOmega(model, POLICY, train=True), []
+    with torch.no_grad():
+        for frame in range(12):
+            predictions = reference.step(inputs["images"][:, frame], inputs["depth"][:, frame], inputs["mask"][:, frame])
+            loss = trainer.criterion(predictions, train_stream.frame_targets(targets, frame), progress=1.0)
+            frames.append({key: float(value) for key, value in loss.items()})
+    trainer.stream.reset(max_frames=24)  # a training window in progress keeps its caches
+    trainer.stream.step(inputs["images"][:, 0], inputs["depth"][:, 0], inputs["mask"][:, 0])
+    caches = trainer.stream.caches
+    weights = {key: value.clone() for key, value in model.state_dict().items()}
+    got = trainer.evaluate_window(inputs, targets)
+    assert got.keys() == frames[0].keys()
+    for key in got:
+        assert got[key] == pytest.approx(np.mean([frame[key] for frame in frames]), rel=1e-12, abs=1e-15), key
+    assert trainer.stream.t == 1 and trainer.stream.caches is caches and trainer.update == 0
+    assert all(parameter.grad is None for parameter in model.parameters())
+    assert all(torch.equal(value, weights[key]) for key, value in model.state_dict().items())
+
+
+def test_validation_loss_is_the_window_mean_in_eval_mode_with_the_random_states_restored(recipe, monkeypatch):
+    cfg = _fp64(recipe())
+    model = _tiny_model(torch.float32)
+    trainer = train_stream.StreamTrainer(model, POLICY, cfg, updates=4)
+    windows = train_stream.validation_windows(recipe(), 2, 12)
+    seen, evaluate = [], trainer.evaluate_window
+
+    def recorded(inputs, targets):
+        seen.append((model.training, tuple(inputs["images"].shape)))
+        seen.append(evaluate(inputs, targets))
+        return seen[-1]
+
+    monkeypatch.setattr(trainer, "evaluate_window", recorded)
+    torch.manual_seed(5)
+    state = torch.get_rng_state()
+    score = train_stream.validation_loss(trainer, windows, torch.device("cpu"))
+    assert torch.equal(torch.get_rng_state(), state) and model.training
+    assert seen[0] == seen[2] == (False, (1, 12, 3, 42, 56))
+    assert score == {key: pytest.approx((seen[1][key] + seen[3][key]) / 2) for key in seen[1]}
+
+
+def _checkpoint_names(run):
+    return {path.name for path in run.iterdir() if path.is_dir() and path.name.startswith(("checkpoint", "final"))}
+
+
+@pytest.mark.parametrize("keep_best", [0, 1])
+def test_a_run_keeps_the_best_checkpoints_by_their_smoke_score(recipe, tiny_build, tmp_path, keep_best):
+    recipe()
+    init, _ = _init_checkpoint(tmp_path)
+    output = tmp_path / "stream_TX"
+    assert train_stream.main(_arguments(init, output, "--keep-best", str(keep_best), "--val-windows", "2")) == 0
+    run = output / "omnivggt-omega-colmap-rgbd"
+    audit = json.loads((run / "checkpoints.json").read_text())
+    scores = {entry["name"]: entry["score"] for entry in audit["checkpoints"]}
+    assert list(scores) == ["checkpoint-u1", "final_checkpoint"] and audit["keep_best"] == keep_best
+    assert all(math.isfinite(score) for score in scores.values())
+    best = min(scores, key=scores.get)
+    assert _checkpoint_names(run) == {"final_checkpoint"} | ({best} if keep_best else set())
+    extra = audit["checkpoints"][0]["extra"]
+    assert extra["split"] == "smoke" and extra["windows"] == 2 and extra["components"]["objective"] == scores[
+        "checkpoint-u1"]
+    record = json.loads((run / "stream_training.json").read_text())
+    assert record["keep_best"] == keep_best
+    assert record["validation"]["split"] == "smoke" and len(record["validation"]["anchors"]) == 2
+
+
+def test_scoring_the_checkpoints_does_not_change_the_training_run(recipe, tiny_build, tmp_path, monkeypatch):
+    recipe()
+    init, _ = _init_checkpoint(tmp_path)
+    arguments = ("--window-length", "24", "--keep-best", "2")  # checkpoint-u1 is saved and scored mid-window
+    assert train_stream.main(_arguments(init, tmp_path / "scored", *arguments)) == 0
+    monkeypatch.setattr(train_stream, "validation_loss", lambda trainer, windows, device: {"objective": 0.0})
+    assert train_stream.main(_arguments(init, tmp_path / "unscored", *arguments)) == 0
+    for name in ("checkpoint-u1", "final_checkpoint"):
+        scored, unscored = (load_file(tmp_path / run / "omnivggt-omega-colmap-rgbd" / name / "model.safetensors")
+                            for run in ("scored", "unscored"))
+        assert scored.keys() == unscored.keys()
+        assert all(torch.equal(scored[key], unscored[key]) for key in scored), name
