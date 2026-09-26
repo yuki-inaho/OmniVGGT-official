@@ -95,9 +95,9 @@ inputs = {
     'camera_gt_index': camera_indices
 }
 
-# Run inference
+# Run inference (forward() is the training path and picks the conditioned views at random)
 with torch.no_grad():
-    predictions = model(**inputs)
+    predictions = model.inference(**inputs)
 ```
 
 ### Advanced Options
@@ -349,6 +349,8 @@ fine-tunes from the released weights; paths are passed as environment variables:
 export OMNIVGGT_COLMAP_RGBD_ROOTS=/path/staging_a,/path/staging_b
 export OMNIVGGT_INIT_CHECKPOINT=checkpoints/OmniVGGT.safetensors
 export OMNIVGGT_OUTPUT_DIR=/path/runs
+# recipe of the results below: 12 images/step, frozen image encoder, 2 epochs x 1,560 = 3,120 steps
+export OMNIVGGT_TRAIN_BATCH_IMAGES=12 OMNIVGGT_PATCH_EMBED_FREEZE=1 OMNIVGGT_STEPS_PER_EPOCH=1560
 uv run accelerate launch --num_processes 1 --mixed_precision bf16 \
   train_omnivggt.py --config configs/train_colmap_rgbd.py
 PYTHONPATH=tools uv run python -m eval_colmap_rgbd --roots /path/staging_a /path/staging_b --split val \
@@ -384,6 +386,7 @@ export OMNIVGGT_INIT_OMNI=checkpoints/OmniVGGT.safetensors
 export OMNIVGGT_INIT_OMEGA=/path/vggt_omega_1b_416_reproduce.pt   # only for omega_global_* maps
 export OMNIVGGT_OMEGA_VARIANT=configs/omnivggt_omega/variants/V5.json
 export OMNIVGGT_OUTPUT_DIR=/path/runs/omega_V5
+export OMNIVGGT_TRAIN_BATCH_IMAGES=12 OMNIVGGT_PATCH_EMBED_FREEZE=1 OMNIVGGT_STEPS_PER_EPOCH=1560  # as the baseline
 uv run accelerate launch --num_processes 1 --mixed_precision bf16 \
   train_omnivggt.py --config configs/train_colmap_rgbd_omega.py
 PYTHONPATH=tools uv run python -m eval_colmap_rgbd --model-config $OMNIVGGT_OMEGA_VARIANT \
@@ -404,8 +407,10 @@ with the learning rates scaled by `amuse_patch_embed_lr_scale` (0.5, the same ra
 
 **Results on our own RGB-D sequences** (variant V5: inter-frame blocks from VGGT-Ω, i.e. FAIR
 Noncommercial weights, everything else from OmniVGGT; two sequences of a rail-mounted RGB-D camera; fine-tuned with
-the same data and recipe as the OmniVGGT baseline: 12 images/step, 3,120 steps, frozen image encoder;
-validation split, 16 samples x 8 frames at 392x294; RTX 5090, bf16):
+the same data and recipe as the OmniVGGT baseline: 12 images/step, 3,120 steps, frozen image encoder, bf16
+mixed precision; RTX 5090. Accuracy: `tools/eval_colmap_rgbd.py`, validation split, 16 samples x 8 frames at
+392x294, fp32. Latency and memory: `tools/bench_inference.py`, synthetic inputs, batch 1, bf16 autocast for the
+aggregator with fp32 heads; accuracy was not measured under bf16 inference):
 
 | | OmniVGGT (fine-tuned) | OmniVGGTOmega V5 |
 | :--- | ---: | ---: |
@@ -415,11 +420,13 @@ validation split, 16 samples x 8 frames at 392x294; RTX 5090, bf16):
 
 Accuracy was compared against the fine-tuned OmniVGGT with thresholds fixed before training
 (`configs/omnivggt_omega/equivalence_thresholds.json`, `tools/compare_eval.py`). With the baseline
-recipe 7 of the 24 checks fail. With AMUSE (same number of steps) or twice the steps, all camera-pose
-checks pass (AMUSE exceeds the baseline AUC@30 in every condition, e.g. RGB-only 0.984 vs 0.977) and depth
-with auxiliary depth input is better than the baseline, but **depth without auxiliary depth input stays worse** (AbsRel 0.065-0.077 vs 0.056 depending
-on the recipe; closest with twice the steps and an unfrozen image encoder), so the pre-registered
-equivalence test was not passed. A control run with the original inter-frame attention but no point head and the depth-derived
+recipe 7 of the 24 checks fail. With AMUSE (same number of steps) or twice the steps (`--num_train_epochs 4`),
+all camera-pose checks pass and depth with auxiliary depth input is better than the baseline. The best of these
+runs, AMUSE with twice the steps and a trainable image encoder, exceeds the baseline AUC@30 in every condition
+(e.g. RGB-only 0.987 vs 0.977, RGB-D with camera 0.999 vs 0.990) and lowers the depth AbsRel with auxiliary depth
+input from 0.027 to 0.019. **Depth without auxiliary depth input stays worse** (AbsRel 0.065-0.077 vs 0.056
+depending on the recipe; 2 of the 24 checks still fail in the best runs), so the pre-registered equivalence test
+was not passed; the longer runs also train more than the baseline, so they are not an equal-budget comparison. A control run with the original inter-frame attention but no point head and the depth-derived
 point loss matched the baseline (AbsRel 0.055), so the gap comes from the inter-frame attention change,
 not from removing the point head; that configuration alone is 1.13-1.16x faster.
 
