@@ -39,7 +39,7 @@ def _train_dataset(views=""):
 def env(monkeypatch):
     monkeypatch.setenv("OMNIVGGT_COLMAP_RGBD_ROOTS", "/data/a,/data/b")
     monkeypatch.setenv("OMNIVGGT_OMEGA_VARIANT", "configs/omnivggt_omega/variants/V5.json")
-    for name in (*OPTIONS, "OMNIVGGT_STEPS_PER_EPOCH", "OMNIVGGT_GRAD_ACCUM", "OMNIVGGT_RESOLUTION"):
+    for name in (*OPTIONS, "OMNIVGGT_STEPS_PER_EPOCH", "OMNIVGGT_GRAD_ACCUM", "OMNIVGGT_RESOLUTION", "OMNIVGGT_DATA_SEED"):
         monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
@@ -175,10 +175,10 @@ TRAIN, VAL = 50, 12  # frames per scene: train 0..49, guard 50..51, val 52..63
 SCENES = ("scene_000000", "scene_000001")
 
 
-def _write_scene(scene, rng):
+def _write_scene(scene, rng, train_frames=TRAIN, val_frames=VAL):
     (scene / "rgb").mkdir(parents=True)
     (scene / "depth").mkdir()
-    frames = TRAIN + 2 + VAL
+    frames = train_frames + 2 + val_frames
     k = np.array([[60.0, 0, W / 2], [0, 60.0, H / 2], [0, 0, 1]], dtype=np.float32)
     w2c = np.zeros((frames, 3, 4), dtype=np.float32)
     for index in range(frames):
@@ -189,7 +189,7 @@ def _write_scene(scene, rng):
         depth[:4] = 0
         Image.fromarray(depth).save(scene / "depth" / f"frame_{index:06d}.png")
     np.savez_compressed(scene / "cameras.npz", intrinsics=np.repeat(k[None], frames, 0), extrinsics_w2c=w2c)
-    train, val = np.arange(TRAIN).reshape(-1, 10), np.arange(TRAIN + 2, frames).reshape(-1, 6)
+    train, val = np.arange(train_frames).reshape(-1, 10), np.arange(train_frames + 2, frames).reshape(-1, 6)
     np.savez_compressed(
         scene / "sequences.npz",  # sequences padded with -1 to length 10
         sequences=np.concatenate([train, np.pad(val, ((0, 0), (0, 4)), constant_values=-1)]),
