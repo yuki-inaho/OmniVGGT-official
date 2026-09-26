@@ -378,14 +378,28 @@ def _pose_enc(w2c, height, width):
 
 
 class OracleModel:
-    """``model.inference`` stand-in that returns the GT cameras and GT depth of the frames it is given."""
+    """``model.inference`` stand-in that returns the GT cameras and GT depth of the frames it is given, with the
+    world points unprojected from them and unit confidences."""
 
     def __init__(self):
-        self.calls = []
+        self.calls, self.options = [], []
 
-    def inference(self, images, extrinsics, intrinsics, depth, mask, depth_gt_index, camera_gt_index):
+    def inference(self, images, extrinsics, intrinsics, depth, mask, depth_gt_index, camera_gt_index, **options):
+        import torch
+
+        from omnivggt.utils.geometry import unproject_depth_to_world_points_torch
+        from omnivggt.utils.pose_enc import pose_encoding_to_extri_intri
+
         self.calls.append((images.shape[1], list(depth_gt_index), list(camera_gt_index)))
-        return {"pose_enc": _pose_enc(extrinsics, *images.shape[-2:]), "depth": depth.clone()}
+        self.options.append(options)
+        pose_enc = _pose_enc(extrinsics, *images.shape[-2:])
+        cameras = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+        return {
+            "pose_enc": pose_enc,
+            "depth": depth.clone(),
+            "depth_conf": torch.ones(depth.shape[:-1]),
+            "world_points": unproject_depth_to_world_points_torch(depth, *cameras),
+        }
 
 
 class FakeStreaming:
@@ -455,6 +469,10 @@ def test_modes_build_the_pre_registered_models(monkeypatch, tmp_path):
         "bidir_f0": {"causal": False, "depth_norm": "first_frame"},
         "bidir_prefix": {"causal": False, "depth_norm": "first_frame"},
         "stream": {"causal": True, "depth_norm": "first_frame"},
+        "causal_batch": {"causal": True, "depth_norm": "first_frame"},
+        "bidir_band": {"causal": False, "depth_norm": "first_frame"},
+        "g2f": {"causal": False, "depth_norm": "first_frame"},  # --g2f-causal: causal True
+        "chunk": {"causal": False, "depth_norm": "first_frame"},  # bidir_f0 per chunk
     }
     built = []
     monkeypatch.setattr(OmniVGGTOmega, "from_variant", staticmethod(lambda path, **options: built.append(options)))
@@ -648,6 +666,7 @@ def test_main_records_provenance_metrics_and_efficiency(monkeypatch, tmp_path, r
     provenance = result["provenance"]
     assert provenance["checkpoint"]["sha256"] == sha256 and provenance["model_config"]["variant"] == {"name": "V9"}
     assert provenance["mode"] == mode and provenance["model_options"] == eval_stream.MODES[mode]
+    assert provenance["mode_arguments"] == {}
     assert provenance["policy"] == ("full" if mode == "stream" else None)
     assert provenance["precision"]["name"] == "fp32" and provenance["precision"]["tf32_matmul"] is False
     assert len(provenance["git"]["commit"]) == 40 and isinstance(provenance["git"]["dirty"], bool)
@@ -682,3 +701,391 @@ def test_mean_over_windows_by_session():
         "s1": {"a": 5.0, "b": 1.0},
         "all": {"a": 3.0},
     }
+
+
+# ---------------------------------------------------------------- phase-5 modes: causal_batch, bidir_band, g2f
+G2F_ARGUMENTS = {"g2f_k": 6, "frame_only_layers": [0, 1, 3, 4, 5], "g2f_causal": False}
+
+
+def test_g2f_k_names_the_pre_registered_layer_sets():
+    import eval_stream
+
+    assert eval_stream.G2F_LAYERS == {3: (0, 1, 3), 6: (0, 1, 3, 4, 5), 9: (0, 1, 3, 4, 5, 7, 8)}
+    for k, layers in eval_stream.G2F_LAYERS.items():  # global layers <= k, without the register layers 2, 6, 9
+        assert layers == tuple(i for i in range(k + 1) if i not in (2, 6, 9))
+
+
+def test_mode_arguments_belong_to_their_mode():
+    import eval_stream
+
+    check = eval_stream.check_mode_arguments
+    for mode in ("bidir", "bidir_f0", "bidir_prefix", "stream", "causal_batch"):
+        assert check(mode) == {}
+    assert check("bidir_band", band_width=4) == {"band_width": 4}
+    assert check("g2f", g2f_k=6) == G2F_ARGUMENTS
+    assert check("g2f", g2f_k=3, g2f_causal=True) == {"g2f_k": 3, "frame_only_layers": [0, 1, 3], "g2f_causal": True}
+    for mode, arguments, match in (
+        ("bidir_band", {}, "band-width"),
+        ("bidir_band", {"band_width": 0}, "band-width"),
+        ("bidir_f0", {"band_width": 4}, "band-width"),
+        ("g2f", {"g2f_k": 3, "band_width": 4}, "band-width"),
+        ("g2f", {}, "g2f-k"),
+        ("g2f", {"g2f_k": 4}, "g2f-k"),
+        ("causal_batch", {"g2f_k": 3}, "g2f-k"),
+        ("bidir", {"g2f_causal": True}, "g2f-causal"),
+        ("bidir_band", {"band_width": 4, "g2f_causal": True}, "g2f-causal"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            check(mode, **arguments)
+
+
+def test_g2f_causal_makes_the_g2f_model_frame_causal():
+    import eval_stream
+
+    assert eval_stream.model_options("g2f", G2F_ARGUMENTS) == {"causal": False, "depth_norm": "first_frame"}
+    causal = {**G2F_ARGUMENTS, "g2f_causal": True}
+    assert eval_stream.model_options("g2f", causal) == {"causal": True, "depth_norm": "first_frame"}
+    assert eval_stream.model_options("bidir_band", {"band_width": 4}) == eval_stream.MODES["bidir_band"]
+    for mode in ("bidir", "stream", "causal_batch"):
+        assert eval_stream.model_options(mode, {}) == eval_stream.MODES[mode]
+
+
+def test_cli_takes_the_mode_arguments():
+    import eval_stream
+
+    parser = eval_stream.build_parser()
+    base = ["--model-config", "V5.json", "--checkpoint", "ckpt", "--roots", "a", "--split", "val", "--preset", "L8"]
+    base += ["--output", "o.json"]
+    args = parser.parse_args([*base, "--mode", "g2f", "--g2f-k", "9", "--g2f-causal"])
+    assert (args.g2f_k, args.g2f_causal, args.band_width) == (9, True, None)
+    args = parser.parse_args([*base, "--mode", "bidir_band", "--band-width", "8"])
+    assert (args.band_width, args.g2f_k, args.g2f_causal) == (8, None, False)
+    for extra in (["--mode", "g2f", "--g2f-k", "4"], ["--mode", "bidir_band", "--band-width", "wide"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args([*base, *extra])
+
+
+def test_batch_modes_pass_their_inference_options(roots):
+    import eval_stream
+    import torch
+
+    from omnivggt.stream.visibility import band_visibility
+
+    _, inputs = _window(roots)
+    model, meter = OracleModel(), eval_stream.Meter("cpu")
+    eval_stream.make_predictor("bidir_band", model, None, "fp32", meter, {"band_width": 2})(inputs, True)
+    eval_stream.make_predictor("g2f", model, None, "fp32", meter, G2F_ARGUMENTS)(inputs, False)
+    eval_stream.make_predictor("causal_batch", model, None, "fp32", meter)(inputs, True)
+    band, g2f, causal = model.options
+    assert list(band) == ["frame_visibility"] and torch.equal(band["frame_visibility"], band_visibility(8, 2))
+    assert g2f == {"frame_only_layers": [0, 1, 3, 4, 5]} and causal == {}
+    assert model.calls == [(8, list(range(8)), []), (8, [], []), (8, list(range(8)), [])]
+    for mode in ("bidir_band", "g2f"):
+        with pytest.raises(ValueError, match="argument"):
+            eval_stream.make_predictor(mode, model, None, "fp32", meter)
+
+
+@pytest.mark.parametrize("use_depth", [True, False])
+def test_causal_batch_mode_equals_the_full_cache_stream(use_depth):
+    import eval_stream
+    import torch
+    from test_stream_causal import _inputs, _model
+
+    model, inputs = _model(causal=True, depth_norm="first_frame"), _inputs()
+    meter = eval_stream.Meter("cpu")
+    batch = eval_stream.make_predictor("causal_batch", model, None, "fp32", meter)(inputs, use_depth)
+    stream = eval_stream.make_predictor("stream", model, "full", "fp32", meter)(inputs, use_depth)
+    assert len(batch["step_ms"]) == 1 and "kv_bytes" not in batch and len(stream["step_ms"]) == 4
+    # a fp32 stream cache under the fp64 tiny model, and fp32 predictions: the tolerance is fp32 rounding
+    torch.testing.assert_close(batch["pose_enc"], stream["pose_enc"], atol=1e-6, rtol=0)
+    torch.testing.assert_close(batch["depth"], stream["depth"], atol=1e-6, rtol=1e-6)
+
+
+def test_band_and_g2f_modes_run_the_model_with_their_options():
+    import eval_stream
+    import torch
+    from test_stream_causal import _inputs, _model
+
+    from omnivggt.stream.visibility import band_visibility
+
+    model, inputs = _model(depth_norm="first_frame"), _inputs()
+    meter = eval_stream.Meter("cpu")
+    tiny_g2f = {"g2f_k": 3, "frame_only_layers": [0, 2], "g2f_causal": False}  # TINY's layer 1 is a register layer
+    band = eval_stream.make_predictor("bidir_band", model, None, "fp32", meter, {"band_width": 1})(inputs, True)
+    g2f = eval_stream.make_predictor("g2f", model, None, "fp32", meter, tiny_g2f)(inputs, True)
+    views = {"depth_gt_index": [0, 1, 2, 3], "camera_gt_index": []}
+    with torch.no_grad():
+        want_band = model.inference(**inputs, **views, frame_visibility=band_visibility(4, 1))
+        want_g2f = model.inference(**inputs, **views, frame_only_layers=[0, 2])
+        default = model.inference(**inputs, **views)
+    for got, want in ((band, want_band), (g2f, want_g2f)):
+        assert torch.equal(got["pose_enc"], want["pose_enc"].float())
+        assert torch.equal(got["depth"], want["depth"].float())
+        assert not torch.equal(got["pose_enc"], default["pose_enc"].float())
+
+
+@pytest.mark.parametrize(
+    "mode, extra, arguments, options",
+    [
+        ("causal_batch", [], {}, {"causal": True, "depth_norm": "first_frame"}),
+        ("bidir_band", ["--band-width", "4"], {"band_width": 4}, {"causal": False, "depth_norm": "first_frame"}),
+        ("g2f", ["--g2f-k", "6"], G2F_ARGUMENTS, {"causal": False, "depth_norm": "first_frame"}),
+        (
+            "g2f",
+            ["--g2f-k", "3", "--g2f-causal"],
+            {"g2f_k": 3, "frame_only_layers": [0, 1, 3], "g2f_causal": True},
+            {"causal": True, "depth_norm": "first_frame"},
+        ),
+    ],
+)
+def test_main_records_the_mode_arguments(monkeypatch, tmp_path, roots, mode, extra, arguments, options):
+    result, built, _ = _run_main(monkeypatch, tmp_path, roots, ["--windows", "s0:12-19", "--mode", mode, *extra])
+    assert [model_options for *_, model_options in built] == [options]
+    provenance = result["provenance"]
+    assert provenance["mode"] == mode and provenance["mode_arguments"] == arguments
+    assert provenance["model_options"] == options and provenance["policy"] is None
+    assert result["windows"][0]["conditions"]["depth"]["metrics"]["ate_g1_rmse_mm"] < 1e-3
+
+
+def test_main_rejects_the_arguments_of_other_modes(tmp_path):
+    import eval_stream
+
+    output = tmp_path / "result.json"
+    argv = ["--model-config", "V5.json", "--checkpoint", "ckpt", "--roots", "a", "--split", "val", "--preset", "L8"]
+    argv += ["--device", "cpu", "--output", str(output)]
+    for extra, match in (
+        (["--mode", "bidir_f0", "--band-width", "4"], "band-width"),
+        (["--mode", "g2f"], "g2f-k"),
+        (["--mode", "stream", "--policy", "full", "--g2f-causal"], "g2f-causal"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            eval_stream.main([*argv, *extra])
+    assert not output.exists()
+
+
+# ---------------------------------------------------------------- phase-5 chunk mode (VGGT-Long style, offline)
+CHUNK_ARGUMENTS = {"chunk": 4, "overlap": 2}
+ALIGNMENT = {"pixel_step": 4, "min_weight_ratio": 0.1, "irls_iterations": 5, "huber_delta": "median_initial_residual"}
+GAUGE_AXIS = np.array([0.3, 1.0, -0.4]) / np.linalg.norm([0.3, 1.0, -0.4])
+
+
+def _gauge(chunk):
+    """The similarity (scale, rotation, translation) from the GT world to the world of the ``chunk``-th call."""
+    rotation = Rotation.from_rotvec(np.deg2rad(4.0 * (chunk + 1)) * GAUGE_AXIS).as_matrix()
+    return 0.5 + 0.25 * chunk, rotation, np.array([0.1 * chunk, -0.05, 0.2])
+
+
+def _in_gauge(c2w, scale, rotation, translation):
+    out = c2w.copy()
+    out[..., :3, :3] = rotation @ c2w[..., :3, :3]
+    out[..., :3, 3] = scale * c2w[..., :3, 3] @ rotation.T + translation
+    return out
+
+
+def _gauge_cameras(extrinsics, chunk, size_hw):
+    """(w2c, intrinsics) of GT ``extrinsics`` (1, S, 3, 4) in the gauge of the ``chunk``-th call, focal 50 + chunk."""
+    import torch
+    from rgbd_pose_pipeline.se3 import invert
+
+    c2w = _in_gauge(invert(extrinsics[0].double().numpy()), *_gauge(chunk))
+    w2c = torch.from_numpy(invert(c2w)[None, :, :3]).float()
+    focal, (height, width) = 50.0 + chunk, size_hw
+    k = torch.tensor([[focal, 0.0, width / 2], [0.0, focal, height / 2], [0.0, 0.0, 1.0]])
+    return w2c, k.expand(*w2c.shape[:2], 3, 3)
+
+
+class ChunkModel:
+    """``model.inference`` stand-in whose j-th call predicts the GT cameras, depth and world points of its frames in
+    its own gauge (``_gauge(j)``) with confidences 2 + j. Its pose encoding carries focal 50 + j, so that the output
+    shows which chunk's intrinsics it keeps; the world points are the GT ones (GT intrinsics) in the gauge."""
+
+    def __init__(self):
+        self.calls, self.options, self.outputs = [], [], []
+
+    def inference(self, images, extrinsics, intrinsics, depth, mask, depth_gt_index, camera_gt_index, **options):
+        import torch
+
+        from omnivggt.utils.geometry import unproject_depth_to_world_points_torch
+        from omnivggt.utils.pose_enc import extri_intri_to_pose_encoding
+
+        chunk, size_hw = len(self.calls), images.shape[-2:]
+        self.calls.append((images.shape[1], list(depth_gt_index), list(camera_gt_index)))
+        self.options.append(options)
+        w2c, k = _gauge_cameras(extrinsics, chunk, size_hw)
+        predicted_depth = depth * _gauge(chunk)[0]
+        out = {
+            "pose_enc": extri_intri_to_pose_encoding(w2c, k, size_hw),
+            "depth": predicted_depth,
+            "depth_conf": torch.full(depth.shape[:-1], 2.0 + chunk),
+            "world_points": unproject_depth_to_world_points_torch(predicted_depth, w2c, intrinsics),
+        }
+        self.outputs.append(out)
+        return out
+
+
+def test_chunk_arguments_belong_to_the_chunk_mode():
+    import eval_stream
+
+    check = eval_stream.check_mode_arguments
+    assert check("chunk", chunk=12, overlap=6) == {"chunk": 12, "overlap": 6, "alignment": ALIGNMENT}
+    assert check("chunk", chunk=24, overlap=12)["overlap"] == 12
+    assert check("chunk", chunk=5, overlap=3)["chunk"] == 5  # any valid pair is accepted
+    assert eval_stream.model_options("chunk", CHUNK_ARGUMENTS) == {"causal": False, "depth_norm": "first_frame"}
+    for mode, arguments, match in (
+        ("chunk", {}, "chunk"),
+        ("chunk", {"chunk": 12}, "overlap"),
+        ("chunk", {"overlap": 6}, "chunk"),
+        ("chunk", {"chunk": 12, "overlap": 12}, "overlap"),
+        ("chunk", {"chunk": 12, "overlap": 0}, "overlap"),
+        ("chunk", {"chunk": 1, "overlap": 0}, "chunk"),
+        ("chunk", {"chunk": 12, "overlap": 6, "band_width": 4}, "band-width"),
+        ("chunk", {"chunk": 12, "overlap": 6, "g2f_k": 3}, "g2f-k"),
+        ("bidir_f0", {"chunk": 12, "overlap": 6}, "chunk"),
+        ("bidir_f0", {"overlap": 6}, "overlap"),
+        ("g2f", {"g2f_k": 3, "chunk": 12, "overlap": 6}, "chunk"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            check(mode, **arguments)
+
+
+def test_cli_takes_the_chunk_arguments():
+    import eval_stream
+
+    parser = eval_stream.build_parser()
+    base = ["--model-config", "V5.json", "--checkpoint", "ckpt", "--roots", "a", "--split", "val", "--windows"]
+    base += ["s0:792-855", "--output", "o.json", "--mode", "chunk"]
+    args = parser.parse_args([*base, "--chunk", "12", "--overlap", "6"])
+    assert (args.chunk, args.overlap, args.band_width, args.g2f_k) == (12, 6, None, None)
+    with pytest.raises(SystemExit):
+        parser.parse_args([*base, "--chunk", "twelve", "--overlap", "6"])
+
+
+def test_chunk_mode_chains_the_chunks_into_the_first_chunk_frame(roots):
+    import eval_stream
+    import torch
+    from rgbd_pose_pipeline.se3 import invert
+
+    from omnivggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
+
+    _, inputs = _window(roots)  # 8 frames: chunks 0-3, 2-5, 4-7
+    model, meter = ChunkModel(), eval_stream.Meter("cpu")
+    predict = eval_stream.make_predictor("chunk", model, None, "fp32", meter, CHUNK_ARGUMENTS)
+    prediction = predict(inputs, True)
+    assert model.calls == [(4, [0, 1, 2, 3], [])] * 3 and model.options == [{}] * 3
+    for index, start in enumerate([0, 2, 4]):  # each chunk is the window's frames start..start+3
+        want = inputs["depth"][:, start : start + 4] * _gauge(index)[0]
+        torch.testing.assert_close(model.outputs[index]["depth"], want)
+    owners = [0, 0, 0, 1, 1, 2, 2, 2]
+    assert prediction["chunks"]["starts"] == [0, 2, 4] and prediction["chunks"]["owners"] == owners
+    assert prediction["pose_enc"].shape == (1, 8, 9) and prediction["depth"].shape == (1, 8, 42, 56, 1)
+    assert prediction["pose_enc"].dtype == prediction["depth"].dtype == torch.float32
+
+    # frames 1-3 are the first chunk's prediction itself
+    first = model.outputs[0]
+    assert torch.equal(prediction["pose_enc"][:, :3], first["pose_enc"][:, :3].float())
+    assert torch.equal(prediction["depth"][:, :3], first["depth"][:, :3].float())
+
+    # every frame is the GT in the gauge of the first chunk: later chunks are mapped by their Sim(3)
+    size_hw = inputs["images"].shape[-2:]
+    w2c, _ = _gauge_cameras(inputs["extrinsics"], 0, size_hw)
+    for frame, owner in enumerate(owners):
+        _, k = _gauge_cameras(inputs["extrinsics"][:, frame : frame + 1], owner, size_hw)  # the owner's intrinsics
+        want = extri_intri_to_pose_encoding(w2c[:, frame : frame + 1], k, size_hw)
+        torch.testing.assert_close(prediction["pose_enc"][:, frame : frame + 1], want, atol=2e-5, rtol=0)
+    torch.testing.assert_close(prediction["depth"], inputs["depth"] * _gauge(0)[0], atol=0, rtol=1e-5)
+    pred_w2c, _ = pose_encoding_to_extri_intri(prediction["pose_enc"], size_hw)
+    np.testing.assert_allclose(
+        invert(pred_w2c[0].double().numpy())[:, :3, 3],
+        _in_gauge(invert(inputs["extrinsics"][0].double().numpy()), *_gauge(0))[:, :3, 3],
+        atol=2e-5,
+    )
+    for alignment, chunk in zip(prediction["chunks"]["alignments"], (1, 2), strict=True):
+        assert alignment["scale"] == pytest.approx(_gauge(0)[0] / _gauge(chunk)[0], rel=1e-5)
+        assert alignment["start"] == 2 * chunk and alignment["correspondences"] > 0
+        assert alignment["rotation_deg"] == pytest.approx(4.0 * chunk, abs=1e-3)  # the gauges differ by 4 deg a chunk
+    assert prediction["lookahead_frames"] == 2 and prediction["frame_lookahead"] == [3, 2, 1, 2, 1, 2, 1, 0]
+    assert len(prediction["step_ms"]) == 3 and prediction["memory"] == {}
+
+
+def test_chunk_mode_needs_valid_overlap_points(roots):
+    import eval_stream
+
+    _, inputs = _window(roots)
+    inputs["mask"][:, 2:4] = 0  # the overlap of chunks 0-3 and 2-5
+    predict = eval_stream.make_predictor("chunk", ChunkModel(), None, "fp32", eval_stream.Meter("cpu"), CHUNK_ARGUMENTS)
+    with pytest.raises(ValueError, match="overlap"):
+        predict(inputs, True)
+    with pytest.raises(ValueError, match="argument"):
+        eval_stream.make_predictor("chunk", ChunkModel(), None, "fp32", eval_stream.Meter("cpu"))
+
+
+def test_chunk_mode_refuses_windows_shorter_than_a_chunk(roots):
+    import eval_stream
+
+    _, inputs = _window(roots)
+    predict = eval_stream.make_predictor(
+        "chunk", ChunkModel(), None, "fp32", eval_stream.Meter("cpu"), {"chunk": 12, "overlap": 6}
+    )
+    with pytest.raises(ValueError, match="frames"):
+        predict(inputs, True)
+
+
+def test_chunk_mode_on_the_tiny_model_is_bidir_f0_within_the_first_chunk():
+    import functools
+
+    import eval_stream
+    import torch
+    from test_stream_causal import _inputs, _model
+
+    model, inputs = _model(depth_norm="first_frame"), _inputs(frames=6)
+    meter = eval_stream.Meter("cpu")
+    predictor = functools.partial(eval_stream.make_predictor, model=model, policy=None, precision="fp32", meter=meter)
+    with torch.no_grad():
+        whole = predictor("chunk", arguments={"chunk": 6, "overlap": 3})(inputs, True)  # one chunk: the window
+        batch = predictor("bidir_f0")(inputs, True)
+        chunked = predictor("chunk", arguments=CHUNK_ARGUMENTS)(inputs, True)  # chunks 0-3 and 2-5
+        first = eval_stream.predict_batch(model, {key: value[:, :4] for key, value in inputs.items()}, True, meter)
+    assert torch.equal(whole["pose_enc"], batch["pose_enc"]) and torch.equal(whole["depth"], batch["depth"])
+    assert whole["chunks"]["alignments"] == []
+    assert chunked["chunks"]["starts"] == [0, 2] and chunked["chunks"]["owners"] == [0, 0, 0, 1, 1, 1]
+    assert torch.equal(chunked["pose_enc"][:, :3], first["pose_enc"][:, :3])
+    assert torch.equal(chunked["depth"][:, :3], first["depth"][:, :3])
+    (alignment,) = chunked["chunks"]["alignments"]
+    assert alignment["correspondences"] > 0 and np.isfinite(alignment["scale"]) and alignment["scale"] > 0
+    assert torch.isfinite(chunked["pose_enc"]).all() and torch.isfinite(chunked["depth"]).all()
+
+
+def test_main_records_the_chunk_mode(monkeypatch, tmp_path, roots):
+    extra = ["--windows", "s0:12-19,s1:20-27", "--mode", "chunk", "--chunk", "4", "--overlap", "2"]
+    result, built, _ = _run_main(monkeypatch, tmp_path, roots, [*extra, "--conditions", "depth", "rgb"])
+    assert [options for *_, options in built] == [{"causal": False, "depth_norm": "first_frame"}]
+    provenance = result["provenance"]
+    assert provenance["mode"] == "chunk" and provenance["policy"] is None
+    assert provenance["mode_arguments"] == {**CHUNK_ARGUMENTS, "alignment": ALIGNMENT}
+    for window in result["windows"]:
+        for condition in ("depth", "rgb"):
+            record = window["conditions"][condition]
+            assert record["metrics"]["ate_g1_rmse_mm"] < 1e-3  # the oracle's chunks share one world
+            efficiency = record["efficiency"]
+            assert efficiency["lookahead_frames"] == 2 and efficiency["lookahead_frames_max"] == 3
+            assert efficiency["step_ms"]["n"] == 3 and efficiency["per_frame_ms"] >= 0
+            assert record["series"]["lookahead_frames"] == [3, 2, 1, 2, 1, 2, 1, 0]
+            assert record["chunks"]["starts"] == [0, 2, 4] and len(record["chunks"]["alignments"]) == 2
+            assert record["chunks"]["alignments"][0]["scale"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_main_checks_the_window_length_before_loading_the_model(monkeypatch, tmp_path, roots):
+    import eval_stream
+
+    def load(*args, **kwargs):
+        raise AssertionError("the model must not be loaded")
+
+    monkeypatch.setattr(eval_stream, "_load_model", load)
+    output = tmp_path / "result.json"
+    argv = ["--model-config", "V9.json", "--checkpoint", "ckpt", "--roots", *roots, "--split", "val"]
+    argv += ["--windows", "s0:12-19", "--device", "cpu", "--output", str(output)]
+    with pytest.raises(ValueError, match="frames"):
+        eval_stream.main([*argv, "--mode", "chunk", "--chunk", "12", "--overlap", "6"])
+    with pytest.raises(ValueError, match="overlap"):
+        eval_stream.main([*argv, "--mode", "bidir_f0", "--overlap", "6"])
+    assert not output.exists()

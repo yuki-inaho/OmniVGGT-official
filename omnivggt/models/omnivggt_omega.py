@@ -105,7 +105,13 @@ class OmniVGGTOmega(nn.Module, PyTorchModelHubMixin):
         depth_gt_index=None,
         camera_gt_index=None,
         return_points=True,
+        frame_visibility=None,
+        frame_only_layers=(),
     ):
+        """``frame_visibility`` ([S, S] bool, optional): query frame a attends only to the frames b with
+        ``frame_visibility[a, b]`` in every inter-frame block of the aggregator and in the camera-head trunk (see
+        ``omnivggt.stream.visibility``). None keeps the model's attention (bidirectional, or frame-causal).
+        ``frame_only_layers``: dense global layers of the aggregator that attend within each frame only (G2F)."""
         if images.ndim == 4:
             images = images.unsqueeze(0)
         tokens, patch_start_idx = self.aggregator.inference(
@@ -116,13 +122,15 @@ class OmniVGGTOmega(nn.Module, PyTorchModelHubMixin):
             mask=mask,
             depth_gt_index=depth_gt_index or [],
             camera_gt_index=camera_gt_index or [],
+            frame_visibility=frame_visibility,
+            frame_only_layers=frame_only_layers,
         )
-        return self._predict(tokens, patch_start_idx, images, return_points)
+        return self._predict(tokens, patch_start_idx, images, return_points, frame_visibility=frame_visibility)
 
-    def _predict(self, tokens, patch_start_idx, images, return_points):
+    def _predict(self, tokens, patch_start_idx, images, return_points, frame_visibility=None):
         predictions = {}
         with torch.amp.autocast("cuda", enabled=False):
-            pose_enc_list = self.camera_head(tokens)
+            pose_enc_list = self.camera_head(tokens, frame_visibility=frame_visibility)
             predictions["pose_enc"] = pose_enc_list[-1]
             predictions["pose_enc_list"] = pose_enc_list
             depth, depth_conf = self.depth_head(tokens, images=images, patch_start_idx=patch_start_idx)
