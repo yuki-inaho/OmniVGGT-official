@@ -62,6 +62,6 @@ class OmegaStyleAggregator(ZeroAggregator):
         special_mask = None
         if attn_mask is not None:  # the same inter-frame mask, restricted to the special tokens of every frame
             special_mask = attn_mask.view(S, P, S, P)[:, :prefix, :, :prefix].reshape(S * prefix, S * prefix)
-        special = self._run_global_block(self.global_blocks[global_idx], special, special_pos, special_mask)
+        special = self._run_global_block(global_idx, special, special_pos, special_mask)
         tokens = torch.cat([special.reshape(B, S, prefix, C), tokens[:, :, prefix:]], dim=2)
         return tokens.reshape(B, S * P, C), global_idx + 1, [tokens]

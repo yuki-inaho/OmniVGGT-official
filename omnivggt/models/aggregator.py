@@ -325,14 +325,15 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            tokens = self._run_global_block(self.global_blocks[global_idx], tokens, pos, attn_mask)
+            tokens = self._run_global_block(global_idx, tokens, pos, attn_mask)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
 
-    def _run_global_block(self, block, tokens, pos=None, attn_mask=None):
-        """Run one global (inter-frame) block, under gradient checkpointing when training."""
+    def _run_global_block(self, layer_idx, tokens, pos=None, attn_mask=None):
+        """Run global (inter-frame) block ``layer_idx``, under gradient checkpointing when training."""
+        block = self.global_blocks[layer_idx]
         if self.use_checkpoint and self.training:
             return checkpoint(block, tokens, pos, attn_mask, use_reentrant=False)
         return block(tokens, pos=pos, attn_mask=attn_mask)

@@ -194,11 +194,18 @@ def test_causal_training_forward_through_gradient_checkpoints_is_frame_causal():
 
 
 def test_aggregator_stream_context_is_unset_by_default():
-    model = _model()
+    model = _model(causal=True, depth_norm="first_frame")
     assert model.aggregator._stream is None
-    model.aggregator._stream = object()  # the streaming context is not implemented at this layer yet
-    with pytest.raises(NotImplementedError):
+    model.aggregator._stream = object()  # a streaming context (omnivggt.stream.streaming) runs one frame per call
+    with pytest.raises(ValueError, match="one frame"):
         _infer_aggregator(model, _inputs(), [])
+
+
+def test_aggregator_stream_context_rejects_the_training_forward():
+    model = _model(causal=True, depth_norm="first_frame", cam_drop_prob=1.0, depth_all_views=True).train()
+    model.aggregator._stream = object()
+    with pytest.raises(NotImplementedError, match="inference"):
+        model.aggregator(**_inputs(), modality_rng=np.random.default_rng(0))
 
 
 # --- camera head: frame-causal trunk ---------------------------------------------------------------------
@@ -265,10 +272,10 @@ def test_camera_head_keeps_the_sequential_trunk_and_state_dict_keys():
 
 
 def test_camera_head_stream_context_is_unset_by_default():
-    head = _camera_head()
+    head = _camera_head(causal=True)
     assert head._stream is None
-    head._stream = object()  # the streaming context is not implemented at this layer yet
-    with pytest.raises(NotImplementedError):
+    head._stream = object()  # a streaming context (omnivggt.stream.streaming) runs one frame per call
+    with pytest.raises(ValueError, match="one frame"):
         head([_camera_tokens()])
 
 

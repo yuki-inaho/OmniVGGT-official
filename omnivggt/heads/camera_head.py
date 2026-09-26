@@ -16,6 +16,8 @@ from omnivggt.layers.block import Block
 from omnivggt.heads.head_act import activate_pose
 from omnivggt.stream.masks import frame_causal_mask
 
+NUM_ITERATIONS = 4  # refinement iterations of CameraHead.forward (the models use the default)
+
 
 class CameraHead(nn.Module):
     """
@@ -23,6 +25,8 @@ class CameraHead(nn.Module):
 
     It applies a series of transformer blocks (the "trunk") to dedicated camera tokens, one per frame.
     With ``causal=True`` the trunk attention is frame-causal (lower-triangular): frame a sees frames b <= a.
+    ``_stream`` is set only while ``omnivggt.stream.streaming.StreamingOmega`` runs one frame: trunk block j of
+    refinement iteration i then attends to its own KV cache (i, j).
     """
 
     def __init__(
@@ -85,7 +89,7 @@ class CameraHead(nn.Module):
             drop=0,
         )
 
-    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4) -> list:
+    def forward(self, aggregated_tokens_list: list, num_iterations: int = NUM_ITERATIONS) -> list:
         """
         Forward pass to predict camera parameters.
 
@@ -97,8 +101,6 @@ class CameraHead(nn.Module):
         Returns:
             list: A list of predicted camera encodings (post-activation) from each iteration.
         """
-        if self._stream is not None:
-            raise NotImplementedError("a streaming context is set, but this camera head only runs whole batches")
         # Use tokens from the last block for camera prediction.
         tokens = aggregated_tokens_list[-1]
 
@@ -123,10 +125,15 @@ class CameraHead(nn.Module):
         B, S, C = pose_tokens.shape  # S is expected to be 1.
         pred_pose_enc = None
         pred_pose_enc_list = []
-        # one token per frame, so the frame-causal mask is lower-triangular
-        attn_mask = frame_causal_mask(S, 1, pose_tokens.device) if self.causal else None
+        if self._stream is not None and S != 1:
+            raise ValueError(f"a streaming context runs one frame per call, got {S} frames")
+        if self._stream is not None and num_iterations != self._stream.camera_iterations:
+            raise ValueError(f"the stream has camera caches for {self._stream.camera_iterations} iterations, "
+                             f"got num_iterations={num_iterations}")
+        # one token per frame, so the frame-causal mask is lower-triangular (a stream step needs none)
+        attn_mask = frame_causal_mask(S, 1, pose_tokens.device) if self.causal and self._stream is None else None
 
-        for _ in range(num_iterations):
+        for iteration in range(num_iterations):
             # Use a learned empty pose for the first iteration.
             if pred_pose_enc is None:
                 module_input = self.embed_pose(self.empty_pose_tokens.expand(B, S, -1))
@@ -142,8 +149,12 @@ class CameraHead(nn.Module):
             pose_tokens_modulated = gate_msa * modulate(self.adaln_norm(pose_tokens), shift_msa, scale_msa)
             pose_tokens_modulated = pose_tokens_modulated + pose_tokens
 
-            for block in self.trunk:  # an explicit loop over the Sequential, so that every block takes the mask
-                pose_tokens_modulated = block(pose_tokens_modulated, attn_mask=attn_mask)
+            # an explicit loop over the Sequential, so that every block takes the mask or its stream cache
+            for index, block in enumerate(self.trunk):
+                if self._stream is None:
+                    pose_tokens_modulated = block(pose_tokens_modulated, attn_mask=attn_mask)
+                else:
+                    pose_tokens_modulated = self._stream.run_camera(iteration, index, block, pose_tokens_modulated)
             # Compute the delta update for the pose encoding.
             pred_pose_enc_delta = self.pose_branch(self.trunk_norm(pose_tokens_modulated))
 

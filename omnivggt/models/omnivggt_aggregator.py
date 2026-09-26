@@ -28,6 +28,10 @@ class ZeroAggregator(Aggregator):
       selected camera; with ``depth_norm="joint"`` the auxiliary depth still is normalised over all views.
     * ``depth_norm``: the auxiliary depth is divided by the mean valid depth of all selected views
       (``"joint"``) or of frame 0 only (``"first_frame"``), which must then be the first depth view.
+
+    ``_stream`` is set only while ``omnivggt.stream.streaming.StreamingOmega`` runs one frame through
+    ``inference``: the reference special tokens are used at stream time t=1 only, the depth is divided by the
+    stream's first-frame scale, and every inter-frame block attends to its KV cache (``_StreamContext``).
     """
 
     def __init__(self, img_size=518, 
@@ -142,6 +146,7 @@ class ZeroAggregator(Aggregator):
 
         Divides the views of each sample by the mean valid depth of all of them (``depth_norm="joint"``) or of
         the first one (``"first_frame"``; ``_check_inputs`` makes it frame 0), and zeroes the invalid pixels.
+        A streaming context divides by its depth scale instead, set at stream time t=1.
         """
         assert depth.shape[:4] == mask.shape, "mask and depth must have the same first four dimensions"
 
@@ -149,15 +154,19 @@ class ZeroAggregator(Aggregator):
         depth_squeezed = depth.squeeze(-1)
         norm = torch.zeros_like(depth_squeezed)
         reference_views = V if self.depth_norm == "joint" else 1
+        if self._stream is not None and self._stream.depth_scale is None:
+            raise ValueError("the stream has no depth scale: its frame 1 had no depth input")
 
         for b in range(B):
-            valid = depth_squeezed[b, :reference_views][mask[b, :reference_views] > 0]
-            if valid.numel() == 0:
-                if self.depth_norm == "first_frame":
-                    raise ValueError("depth_norm='first_frame': frame 0 has no valid auxiliary depth pixel")
-                continue
-
-            mean = valid.mean()
+            if self._stream is not None:
+                mean = self._stream.depth_scale[b]  # gamma, fixed at stream time t=1
+            else:
+                valid = depth_squeezed[b, :reference_views][mask[b, :reference_views] > 0]
+                if valid.numel() == 0:
+                    if self.depth_norm == "first_frame":
+                        raise ValueError("depth_norm='first_frame': frame 0 has no valid auxiliary depth pixel")
+                    continue
+                mean = valid.mean()
             norm_b = depth_squeezed[b] / (mean + eps)
 
             norm[b] = norm_b * mask[b]
@@ -208,10 +217,10 @@ class ZeroAggregator(Aggregator):
             raise ValueError("depth_norm='first_frame' needs the depth of frame 0 in every training forward: "
                              "set depth_all_views=True (a random depth subset may leave frame 0 out)")
 
-    def _check_inputs(self, depth_gt_index, camera_gt_index):
-        """Reject auxiliary inputs the configured mode cannot use (there is no fallback)."""
-        if self._stream is not None:
-            raise NotImplementedError("a streaming context is set, but this aggregator only runs whole batches")
+    def _check_inputs(self, S, depth_gt_index, camera_gt_index):
+        """Reject inputs the configured mode cannot use (there is no fallback)."""
+        if self._stream is not None and S != 1:
+            raise ValueError(f"a streaming context runs one frame per call, got {S} frames")
         if self.causal and len(camera_gt_index) != 0:
             raise ValueError("causal=True takes no camera input (its normalisation uses every selected camera), "
                              f"got camera_gt_index={list(camera_gt_index)}")
@@ -229,6 +238,8 @@ class ZeroAggregator(Aggregator):
         
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
+        if self._stream is not None:
+            raise NotImplementedError("a streaming context runs through inference() only, one frame per call")
         self._check_training_options()
 
         # Normalize images and reshape for patch embed
@@ -250,7 +261,7 @@ class ZeroAggregator(Aggregator):
         # which views get the auxiliary camera / depth (modality_rng: keyed generator from the training loop)
         camera_gt_index = self.select_camera_gt(S, self.cam_drop_prob, rng=modality_rng)
         depth_gt_index  = self.training_depth_gt_index(S, rng=modality_rng)
-        self._check_inputs(depth_gt_index, camera_gt_index)
+        self._check_inputs(S, depth_gt_index, camera_gt_index)
         
         if len(camera_gt_index) != 0:
             camera_gt_length = len(camera_gt_index)
@@ -362,7 +373,7 @@ class ZeroAggregator(Aggregator):
         
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
-        self._check_inputs(depth_gt_index, camera_gt_index)
+        self._check_inputs(S, depth_gt_index, camera_gt_index)
 
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
@@ -377,9 +388,8 @@ class ZeroAggregator(Aggregator):
         K, P, C = patch_tokens.shape
 
         # Expand camera and register tokens to match batch size and sequence length
-        camera_token = slice_expand_and_flatten(self.camera_token, B, S)
-        register_token = slice_expand_and_flatten(self.register_token, B, S)
-        
+        camera_token, register_token = self._special_tokens(B, S)
+
         if len(camera_gt_index) != 0:
             camera_gt_length = len(camera_gt_index)
             camera_idx_tensor = torch.tensor(camera_gt_index, device=depth.device)
@@ -395,7 +405,7 @@ class ZeroAggregator(Aggregator):
                         pose_encoding_type="absT_quaR_FoV",
             )
             gt_camera_token = self.pose_embeddings[0](pose_encoding).view(B * camera_gt_length, C).unsqueeze(1)
-            
+
             device = depth.device
             camera_full = torch.zeros(K, 1, C, device=device, dtype=camera_token.dtype)
 
@@ -451,7 +461,8 @@ class ZeroAggregator(Aggregator):
         # update P because we added special tokens
         P_old = P
         _, P, C = tokens.shape
-        attn_mask = frame_causal_mask(S, P, tokens.device) if self.causal else None  # of the inter-frame blocks
+        # of the inter-frame blocks; a stream step needs none: its caches hold only the past and the current frame
+        attn_mask = frame_causal_mask(S, P, tokens.device) if self.causal and self._stream is None else None
 
         frame_idx = 0
         global_idx = 0
@@ -477,6 +488,23 @@ class ZeroAggregator(Aggregator):
         del frame_intermediates
         del global_intermediates
         return output_list, self.patch_start_idx
+
+    def _special_tokens(self, B, S):
+        """Camera and register tokens, [B*S, X, C]: the reference ones (index 0) for the first frame only.
+
+        The first frame is batch position 0, or stream time t=1 in a streaming context.
+        """
+        if self._stream is None:
+            return slice_expand_and_flatten(self.camera_token, B, S), slice_expand_and_flatten(self.register_token, B, S)
+        index = 0 if self._stream.is_first else 1
+        return tuple(token[:, index].expand(B, *token.shape[2:]) for token in (self.camera_token, self.register_token))
+
+    def _run_global_block(self, layer_idx, tokens, pos=None, attn_mask=None):
+        if self._stream is None:
+            return super()._run_global_block(layer_idx, tokens, pos, attn_mask)
+        if attn_mask is not None:
+            raise ValueError("a stream step attends to its KV cache and takes no attention mask")
+        return self._stream.run_global(layer_idx, self.global_blocks[layer_idx], tokens, pos)
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, index=None, camera_gt_index=None,
                          pose_encoding=None, register_shape = None, P_old = None):
