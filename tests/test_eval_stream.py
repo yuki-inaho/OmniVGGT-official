@@ -378,15 +378,28 @@ def _pose_enc(w2c, height, width):
 
 
 class OracleModel:
-    """``model.inference`` stand-in that returns the GT cameras and GT depth of the frames it is given."""
+    """``model.inference`` stand-in that returns the GT cameras and GT depth of the frames it is given, with the
+    world points unprojected from them and unit confidences."""
 
     def __init__(self):
         self.calls, self.options = [], []
 
     def inference(self, images, extrinsics, intrinsics, depth, mask, depth_gt_index, camera_gt_index, **options):
+        import torch
+
+        from omnivggt.utils.geometry import unproject_depth_to_world_points_torch
+        from omnivggt.utils.pose_enc import pose_encoding_to_extri_intri
+
         self.calls.append((images.shape[1], list(depth_gt_index), list(camera_gt_index)))
         self.options.append(options)
-        return {"pose_enc": _pose_enc(extrinsics, *images.shape[-2:]), "depth": depth.clone()}
+        pose_enc = _pose_enc(extrinsics, *images.shape[-2:])
+        cameras = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+        return {
+            "pose_enc": pose_enc,
+            "depth": depth.clone(),
+            "depth_conf": torch.ones(depth.shape[:-1]),
+            "world_points": unproject_depth_to_world_points_torch(depth, *cameras),
+        }
 
 
 class FakeStreaming:
@@ -459,6 +472,7 @@ def test_modes_build_the_pre_registered_models(monkeypatch, tmp_path):
         "causal_batch": {"causal": True, "depth_norm": "first_frame"},
         "bidir_band": {"causal": False, "depth_norm": "first_frame"},
         "g2f": {"causal": False, "depth_norm": "first_frame"},  # --g2f-causal: causal True
+        "chunk": {"causal": False, "depth_norm": "first_frame"},  # bidir_f0 per chunk
     }
     built = []
     monkeypatch.setattr(OmniVGGTOmega, "from_variant", staticmethod(lambda path, **options: built.append(options)))
@@ -846,4 +860,232 @@ def test_main_rejects_the_arguments_of_other_modes(tmp_path):
     ):
         with pytest.raises(ValueError, match=match):
             eval_stream.main([*argv, *extra])
+    assert not output.exists()
+
+
+# ---------------------------------------------------------------- phase-5 chunk mode (VGGT-Long style, offline)
+CHUNK_ARGUMENTS = {"chunk": 4, "overlap": 2}
+ALIGNMENT = {"pixel_step": 4, "min_weight_ratio": 0.1, "irls_iterations": 5, "huber_delta": "median_initial_residual"}
+GAUGE_AXIS = np.array([0.3, 1.0, -0.4]) / np.linalg.norm([0.3, 1.0, -0.4])
+
+
+def _gauge(chunk):
+    """The similarity (scale, rotation, translation) from the GT world to the world of the ``chunk``-th call."""
+    rotation = Rotation.from_rotvec(np.deg2rad(4.0 * (chunk + 1)) * GAUGE_AXIS).as_matrix()
+    return 0.5 + 0.25 * chunk, rotation, np.array([0.1 * chunk, -0.05, 0.2])
+
+
+def _in_gauge(c2w, scale, rotation, translation):
+    out = c2w.copy()
+    out[..., :3, :3] = rotation @ c2w[..., :3, :3]
+    out[..., :3, 3] = scale * c2w[..., :3, 3] @ rotation.T + translation
+    return out
+
+
+def _gauge_cameras(extrinsics, chunk, size_hw):
+    """(w2c, intrinsics) of GT ``extrinsics`` (1, S, 3, 4) in the gauge of the ``chunk``-th call, focal 50 + chunk."""
+    import torch
+    from rgbd_pose_pipeline.se3 import invert
+
+    c2w = _in_gauge(invert(extrinsics[0].double().numpy()), *_gauge(chunk))
+    w2c = torch.from_numpy(invert(c2w)[None, :, :3]).float()
+    focal, (height, width) = 50.0 + chunk, size_hw
+    k = torch.tensor([[focal, 0.0, width / 2], [0.0, focal, height / 2], [0.0, 0.0, 1.0]])
+    return w2c, k.expand(*w2c.shape[:2], 3, 3)
+
+
+class ChunkModel:
+    """``model.inference`` stand-in whose j-th call predicts the GT cameras, depth and world points of its frames in
+    its own gauge (``_gauge(j)``) with confidences 2 + j. Its pose encoding carries focal 50 + j, so that the output
+    shows which chunk's intrinsics it keeps; the world points are the GT ones (GT intrinsics) in the gauge."""
+
+    def __init__(self):
+        self.calls, self.options, self.outputs = [], [], []
+
+    def inference(self, images, extrinsics, intrinsics, depth, mask, depth_gt_index, camera_gt_index, **options):
+        import torch
+
+        from omnivggt.utils.geometry import unproject_depth_to_world_points_torch
+        from omnivggt.utils.pose_enc import extri_intri_to_pose_encoding
+
+        chunk, size_hw = len(self.calls), images.shape[-2:]
+        self.calls.append((images.shape[1], list(depth_gt_index), list(camera_gt_index)))
+        self.options.append(options)
+        w2c, k = _gauge_cameras(extrinsics, chunk, size_hw)
+        predicted_depth = depth * _gauge(chunk)[0]
+        out = {
+            "pose_enc": extri_intri_to_pose_encoding(w2c, k, size_hw),
+            "depth": predicted_depth,
+            "depth_conf": torch.full(depth.shape[:-1], 2.0 + chunk),
+            "world_points": unproject_depth_to_world_points_torch(predicted_depth, w2c, intrinsics),
+        }
+        self.outputs.append(out)
+        return out
+
+
+def test_chunk_arguments_belong_to_the_chunk_mode():
+    import eval_stream
+
+    check = eval_stream.check_mode_arguments
+    assert check("chunk", chunk=12, overlap=6) == {"chunk": 12, "overlap": 6, "alignment": ALIGNMENT}
+    assert check("chunk", chunk=24, overlap=12)["overlap"] == 12
+    assert check("chunk", chunk=5, overlap=3)["chunk"] == 5  # any valid pair is accepted
+    assert eval_stream.model_options("chunk", CHUNK_ARGUMENTS) == {"causal": False, "depth_norm": "first_frame"}
+    for mode, arguments, match in (
+        ("chunk", {}, "chunk"),
+        ("chunk", {"chunk": 12}, "overlap"),
+        ("chunk", {"overlap": 6}, "chunk"),
+        ("chunk", {"chunk": 12, "overlap": 12}, "overlap"),
+        ("chunk", {"chunk": 12, "overlap": 0}, "overlap"),
+        ("chunk", {"chunk": 1, "overlap": 0}, "chunk"),
+        ("chunk", {"chunk": 12, "overlap": 6, "band_width": 4}, "band-width"),
+        ("chunk", {"chunk": 12, "overlap": 6, "g2f_k": 3}, "g2f-k"),
+        ("bidir_f0", {"chunk": 12, "overlap": 6}, "chunk"),
+        ("bidir_f0", {"overlap": 6}, "overlap"),
+        ("g2f", {"g2f_k": 3, "chunk": 12, "overlap": 6}, "chunk"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            check(mode, **arguments)
+
+
+def test_cli_takes_the_chunk_arguments():
+    import eval_stream
+
+    parser = eval_stream.build_parser()
+    base = ["--model-config", "V5.json", "--checkpoint", "ckpt", "--roots", "a", "--split", "val", "--windows"]
+    base += ["s0:792-855", "--output", "o.json", "--mode", "chunk"]
+    args = parser.parse_args([*base, "--chunk", "12", "--overlap", "6"])
+    assert (args.chunk, args.overlap, args.band_width, args.g2f_k) == (12, 6, None, None)
+    with pytest.raises(SystemExit):
+        parser.parse_args([*base, "--chunk", "twelve", "--overlap", "6"])
+
+
+def test_chunk_mode_chains_the_chunks_into_the_first_chunk_frame(roots):
+    import eval_stream
+    import torch
+    from rgbd_pose_pipeline.se3 import invert
+
+    from omnivggt.utils.pose_enc import extri_intri_to_pose_encoding, pose_encoding_to_extri_intri
+
+    _, inputs = _window(roots)  # 8 frames: chunks 0-3, 2-5, 4-7
+    model, meter = ChunkModel(), eval_stream.Meter("cpu")
+    predict = eval_stream.make_predictor("chunk", model, None, "fp32", meter, CHUNK_ARGUMENTS)
+    prediction = predict(inputs, True)
+    assert model.calls == [(4, [0, 1, 2, 3], [])] * 3 and model.options == [{}] * 3
+    for index, start in enumerate([0, 2, 4]):  # each chunk is the window's frames start..start+3
+        want = inputs["depth"][:, start : start + 4] * _gauge(index)[0]
+        torch.testing.assert_close(model.outputs[index]["depth"], want)
+    owners = [0, 0, 0, 1, 1, 2, 2, 2]
+    assert prediction["chunks"]["starts"] == [0, 2, 4] and prediction["chunks"]["owners"] == owners
+    assert prediction["pose_enc"].shape == (1, 8, 9) and prediction["depth"].shape == (1, 8, 42, 56, 1)
+    assert prediction["pose_enc"].dtype == prediction["depth"].dtype == torch.float32
+
+    # frames 1-3 are the first chunk's prediction itself
+    first = model.outputs[0]
+    assert torch.equal(prediction["pose_enc"][:, :3], first["pose_enc"][:, :3].float())
+    assert torch.equal(prediction["depth"][:, :3], first["depth"][:, :3].float())
+
+    # every frame is the GT in the gauge of the first chunk: later chunks are mapped by their Sim(3)
+    size_hw = inputs["images"].shape[-2:]
+    w2c, _ = _gauge_cameras(inputs["extrinsics"], 0, size_hw)
+    for frame, owner in enumerate(owners):
+        _, k = _gauge_cameras(inputs["extrinsics"][:, frame : frame + 1], owner, size_hw)  # the owner's intrinsics
+        want = extri_intri_to_pose_encoding(w2c[:, frame : frame + 1], k, size_hw)
+        torch.testing.assert_close(prediction["pose_enc"][:, frame : frame + 1], want, atol=2e-5, rtol=0)
+    torch.testing.assert_close(prediction["depth"], inputs["depth"] * _gauge(0)[0], atol=0, rtol=1e-5)
+    pred_w2c, _ = pose_encoding_to_extri_intri(prediction["pose_enc"], size_hw)
+    np.testing.assert_allclose(
+        invert(pred_w2c[0].double().numpy())[:, :3, 3],
+        _in_gauge(invert(inputs["extrinsics"][0].double().numpy()), *_gauge(0))[:, :3, 3],
+        atol=2e-5,
+    )
+    for alignment, chunk in zip(prediction["chunks"]["alignments"], (1, 2), strict=True):
+        assert alignment["scale"] == pytest.approx(_gauge(0)[0] / _gauge(chunk)[0], rel=1e-5)
+        assert alignment["start"] == 2 * chunk and alignment["correspondences"] > 0
+        assert alignment["rotation_deg"] == pytest.approx(4.0 * chunk, abs=1e-3)  # the gauges differ by 4 deg a chunk
+    assert prediction["lookahead_frames"] == 2 and prediction["frame_lookahead"] == [3, 2, 1, 2, 1, 2, 1, 0]
+    assert len(prediction["step_ms"]) == 3 and prediction["memory"] == {}
+
+
+def test_chunk_mode_needs_valid_overlap_points(roots):
+    import eval_stream
+
+    _, inputs = _window(roots)
+    inputs["mask"][:, 2:4] = 0  # the overlap of chunks 0-3 and 2-5
+    predict = eval_stream.make_predictor("chunk", ChunkModel(), None, "fp32", eval_stream.Meter("cpu"), CHUNK_ARGUMENTS)
+    with pytest.raises(ValueError, match="overlap"):
+        predict(inputs, True)
+    with pytest.raises(ValueError, match="argument"):
+        eval_stream.make_predictor("chunk", ChunkModel(), None, "fp32", eval_stream.Meter("cpu"))
+
+
+def test_chunk_mode_refuses_windows_shorter_than_a_chunk(roots):
+    import eval_stream
+
+    _, inputs = _window(roots)
+    predict = eval_stream.make_predictor(
+        "chunk", ChunkModel(), None, "fp32", eval_stream.Meter("cpu"), {"chunk": 12, "overlap": 6}
+    )
+    with pytest.raises(ValueError, match="frames"):
+        predict(inputs, True)
+
+
+def test_chunk_mode_on_the_tiny_model_is_bidir_f0_within_the_first_chunk():
+    import functools
+
+    import eval_stream
+    import torch
+    from test_stream_causal import _inputs, _model
+
+    model, inputs = _model(depth_norm="first_frame"), _inputs(frames=6)
+    meter = eval_stream.Meter("cpu")
+    predictor = functools.partial(eval_stream.make_predictor, model=model, policy=None, precision="fp32", meter=meter)
+    with torch.no_grad():
+        whole = predictor("chunk", arguments={"chunk": 6, "overlap": 3})(inputs, True)  # one chunk: the window
+        batch = predictor("bidir_f0")(inputs, True)
+        chunked = predictor("chunk", arguments=CHUNK_ARGUMENTS)(inputs, True)  # chunks 0-3 and 2-5
+        first = eval_stream.predict_batch(model, {key: value[:, :4] for key, value in inputs.items()}, True, meter)
+    assert torch.equal(whole["pose_enc"], batch["pose_enc"]) and torch.equal(whole["depth"], batch["depth"])
+    assert whole["chunks"]["alignments"] == []
+    assert chunked["chunks"]["starts"] == [0, 2] and chunked["chunks"]["owners"] == [0, 0, 0, 1, 1, 1]
+    assert torch.equal(chunked["pose_enc"][:, :3], first["pose_enc"][:, :3])
+    assert torch.equal(chunked["depth"][:, :3], first["depth"][:, :3])
+    (alignment,) = chunked["chunks"]["alignments"]
+    assert alignment["correspondences"] > 0 and np.isfinite(alignment["scale"]) and alignment["scale"] > 0
+    assert torch.isfinite(chunked["pose_enc"]).all() and torch.isfinite(chunked["depth"]).all()
+
+
+def test_main_records_the_chunk_mode(monkeypatch, tmp_path, roots):
+    extra = ["--windows", "s0:12-19,s1:20-27", "--mode", "chunk", "--chunk", "4", "--overlap", "2"]
+    result, built, _ = _run_main(monkeypatch, tmp_path, roots, [*extra, "--conditions", "depth", "rgb"])
+    assert [options for *_, options in built] == [{"causal": False, "depth_norm": "first_frame"}]
+    provenance = result["provenance"]
+    assert provenance["mode"] == "chunk" and provenance["policy"] is None
+    assert provenance["mode_arguments"] == {**CHUNK_ARGUMENTS, "alignment": ALIGNMENT}
+    for window in result["windows"]:
+        for condition in ("depth", "rgb"):
+            record = window["conditions"][condition]
+            assert record["metrics"]["ate_g1_rmse_mm"] < 1e-3  # the oracle's chunks share one world
+            efficiency = record["efficiency"]
+            assert efficiency["lookahead_frames"] == 2 and efficiency["lookahead_frames_max"] == 3
+            assert efficiency["step_ms"]["n"] == 3 and efficiency["per_frame_ms"] >= 0
+            assert record["series"]["lookahead_frames"] == [3, 2, 1, 2, 1, 2, 1, 0]
+            assert record["chunks"]["starts"] == [0, 2, 4] and len(record["chunks"]["alignments"]) == 2
+            assert record["chunks"]["alignments"][0]["scale"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_main_checks_the_window_length_before_loading_the_model(monkeypatch, tmp_path, roots):
+    import eval_stream
+
+    def load(*args, **kwargs):
+        raise AssertionError("the model must not be loaded")
+
+    monkeypatch.setattr(eval_stream, "_load_model", load)
+    output = tmp_path / "result.json"
+    argv = ["--model-config", "V9.json", "--checkpoint", "ckpt", "--roots", *roots, "--split", "val"]
+    argv += ["--windows", "s0:12-19", "--device", "cpu", "--output", str(output)]
+    with pytest.raises(ValueError, match="frames"):
+        eval_stream.main([*argv, "--mode", "chunk", "--chunk", "12", "--overlap", "6"])
+    with pytest.raises(ValueError, match="overlap"):
+        eval_stream.main([*argv, "--mode", "bidir_f0", "--overlap", "6"])
     assert not output.exists()
