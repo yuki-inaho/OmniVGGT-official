@@ -216,6 +216,19 @@ def test_invariants_detect_a_missing_anchor_token_and_an_overfull_store():
     assert invariants["protected_complete"] and not invariants["ok"]
 
 
+@pytest.mark.parametrize("tokens, special", [(N, M), (M, M), (1, 1)])
+def test_sliding_window_without_long_term_store_keeps_the_anchor_and_the_recent_frames(tokens, special):
+    """recent=w and no long-term store (the W_N control): the frames leaving the window are evicted."""
+    policy = CachePolicy(recent=3)
+
+    def check(cache, t):
+        whole = sorted({1, *range(max(2, t - 2), t + 1)})
+        assert _rows(cache) == [(frame, j) for frame in whole for j in range(tokens)], t
+        assert cache.invariants()["ok"] and cache.size <= cache.budget == 4 * tokens
+
+    _stream_cache(LayerKVCache(policy, tokens, special, torch.float64, layer_id=0), 9, tokens, check)
+
+
 def test_bounded_cache_keeps_every_candidate_under_the_budget():
     roomy = CachePolicy(recent=W, long_special=10, long_patch=100, selector="recency")
 
@@ -524,3 +537,84 @@ def test_invariants_detect_an_incomplete_long_frame():
     cache._compact(~((frame_id == 4) & (token_id == M + 1)))  # evict one patch of a long frame
     invariants = cache.invariants()
     assert not invariants["long_frames"] and not invariants["ok"]
+
+
+# --- periodic anchors (phase 5) --------------------------------------------------------------------------------
+
+
+def _anchor_frames(t, every, count):
+    """Frame 1 and the newest ``count`` of the frames 1 + kA <= t (k >= 1)."""
+    return [1, *list(range(1 + every, t + 1, every))[-count:]]
+
+
+def test_periodic_anchors_are_promoted_at_1_plus_kA_and_kept_whole():
+    """anchor_every=3, max_anchors=3 without a long-term store: frames 4, 7, 10, ... become anchors at their own
+    step and keep every token; frame 1 always stays, and only the newest 3 promoted anchors do."""
+    policy = CachePolicy(recent=1, anchor_every=3, max_anchors=3)
+
+    def check(cache, t):
+        whole = sorted({*_anchor_frames(t, 3, 3), t})
+        assert _rows(cache) == [(frame, j) for frame in whole for j in range(N)], t
+        assert cache.invariants()["ok"]
+
+    _stream_cache(LayerKVCache(policy, N, M, torch.float64, layer_id=0), 17, N, check)
+    assert _anchor_frames(17, 3, 3) == [1, 10, 13, 16]  # 4 and 7 were demoted (and evicted: no long store)
+
+
+def test_anchor_budget_of_each_layer_kind():
+    policy = CachePolicy(recent=W, long_special=K_U, long_patch=B_P, selector="recency", anchor_every=4,
+                         max_anchors=3)
+    assert policy.budget(N, M) == (1 + 3 + W) * N + M * K_U + B_P == 37
+    assert policy.budget(M, M) == M * (1 + 3 + W + K_U) == 14
+    assert policy.budget(1, 1) == 1 + 3 + W + K_U == 7
+
+
+@pytest.mark.parametrize("tokens, special, quant", [(N, M, None), (N, M, "int8"), (M, M, None), (1, 1, None)])
+def test_anchored_caches_keep_invariants_and_fill_the_budget(tokens, special, quant):
+    """Demoted anchors become long-term candidates; the cache stays within B = (1+n_anchor+w)n + m k_U + b_P and
+    reaches it once every store is full."""
+    policy = CachePolicy(recent=W, long_special=K_U, long_patch=B_P, selector="query", quant=quant, anchor_every=4,
+                         max_anchors=3)
+    cache = LayerKVCache(policy, tokens, special, torch.float64, layer_id=2)
+    grid = (2, 2) if tokens > special else None
+    generator = torch.Generator().manual_seed(3)
+    sizes = []
+    for t in range(1, 31):
+        k, v = _frame_kv(t, tokens)
+        cache.append(k + torch.randn(k.shape, generator=generator, dtype=k.dtype), v, t)
+        cache.commit(_queries(tokens), t, grid_hw=grid)
+        invariants = cache.invariants()
+        assert invariants["ok"] and cache.size <= cache.budget, (t, invariants)
+        whole = _anchor_frames(t, 4, 3)
+        frame_id = cache.row_ids()[0]
+        assert all(int((frame_id == frame).sum()) == tokens for frame in whole), t
+        sizes.append(cache.size)
+    assert cache.budget == policy.budget(tokens, special) and max(sizes) == cache.budget
+
+
+def test_without_periodic_anchors_the_cache_is_unchanged():
+    """The default (anchor_every=None) is the old policy; anchors that never fire leave the rows as they were."""
+    assert (BOUNDED.anchor_every, BOUNDED.max_anchors) == (None, None)
+    late = CachePolicy(recent=W, long_special=K_U, long_patch=B_P, selector="recency", anchor_every=100,
+                       max_anchors=3)
+    caches = [LayerKVCache(policy, N, M, torch.float64, layer_id=3) for policy in (BOUNDED, late)]
+    for t in range(1, 9):
+        for cache in caches:
+            cache.append(*_frame_kv(t, N), t)
+            cache.commit(_queries(N), t)
+        assert _rows(caches[0]) == _rows(caches[1]) == _expected_recency_rows(t)
+        assert torch.equal(caches[0].read()[0], caches[1].read()[0])
+    assert caches[1].budget == caches[0].budget + 3 * N
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(recent=1, anchor_every=3),  # anchor_every and max_anchors go together
+    dict(recent=1, max_anchors=3),
+    dict(recent=1, anchor_every=0, max_anchors=3),
+    dict(recent=1, anchor_every=3, max_anchors=0),
+    dict(recent=1, anchor_every=2.0, max_anchors=3),
+    dict(recent=None, anchor_every=3, max_anchors=3),  # the full cache keeps every frame anyway
+])
+def test_invalid_anchor_policies_raise(kwargs):
+    with pytest.raises(ValueError, match=r"anchor|full"):
+        CachePolicy(**kwargs)

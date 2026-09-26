@@ -118,3 +118,15 @@ def test_eval_stream_allocates_each_window_once():
 
     eval_stream.predict_stream(Recorder(), _inputs(), True, eval_stream.Meter("cpu"))
     assert calls == [4]
+
+
+def test_cache_gate_does_not_count_demoted_anchors_as_requantized():
+    """A demoted anchor enters the quantised long-patch store once, when it stops being an anchor: its rows were
+    never long-patch rows before, so the quantize-once gate must not compare them."""
+    from test_stream_streaming import _sequence
+
+    policy = CachePolicy(recent=1, long_special=1, long_patch=100, selector="recency", quant="int8", anchor_every=2,
+                         max_anchors=1)
+    gate = stream_gates.cache_invariants(_causal(), _sequence(frames=8), policy, quant_layers=(0, 3))
+    assert gate["ok"] and gate["invariants_failed"] == [] and gate["requantized_rows"] == 0
+    assert gate["compared_rows"] > 0

@@ -8,8 +8,9 @@ allows for the next step. Frame ids start at 1 and are consecutive; token ids nu
 
 A bounded cache is partitioned (design doc §4; no row is in two parts) into
 
-* anchor: every token of frame 1, always kept;
-* recent: every token of the ``recent`` newest frames (the current one included, frame 1 excluded);
+* anchor: every token of frame 1, always kept, and with ``anchor_every`` = A of the newest ``max_anchors`` frames
+  1 + kA (k >= 1), each promoted at its own step; a demoted anchor becomes a long-term candidate;
+* recent: every token of the ``recent`` newest frames (the current one included, the anchors excluded);
 * long-special: the special tokens of at most ``long_special`` other frames, selected per frame;
 * long-patch: at most ``long_patch`` other patch tokens, selected per token, or (``long_frames``) every patch
   token of at most ``long_frames`` other frames, selected per frame (IncVGGT-style whole frames).
@@ -24,7 +25,7 @@ codes and block scale/offset until it is evicted; the other parts stay in the ca
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -54,6 +55,8 @@ class CachePolicy:
     * ``long_frames`` (k_P): instead of ``long_patch``, every patch token of at most k_P other frames.
     * ``selector``: one of ``SELECTOR_NAMES``; required exactly when there is a long-term store.
     * ``quant``: ``"int8"`` or ``"int4"`` storage of the long-patch store.
+    * ``anchor_every`` (A) and ``max_anchors`` (n_anchor), together or neither: frame 1 + kA becomes an anchor at
+      step 1 + kA, and the newest n_anchor of them are kept whole besides frame 1.
     """
 
     recent: Optional[int]
@@ -62,16 +65,27 @@ class CachePolicy:
     selector: Optional[str] = None
     quant: Optional[str] = None
     long_frames: int = 0
+    anchor_every: Optional[int] = None
+    max_anchors: Optional[int] = None
 
     def __post_init__(self):
         if self.recent is None:
-            long_term = (self.long_special, self.long_patch, self.long_frames, self.selector, self.quant)
-            if long_term != (0, 0, 0, None, None):
+            others = (self.long_special, self.long_patch, self.long_frames, self.selector, self.quant,
+                      self.anchor_every, self.max_anchors)
+            if others != (0, 0, 0, None, None, None, None):
                 raise ValueError("the full cache (recent=None) keeps every frame: it takes no long-term store, "
-                                 "selector or quantisation")
+                                 "selector, quantisation or periodic anchor")
             return
         if not _is_int(self.recent) or self.recent < 1:
             raise ValueError(f"recent must be an int >= 1 (it includes the current frame), got {self.recent!r}")
+        if (self.anchor_every is None) != (self.max_anchors is None):
+            raise ValueError("periodic anchors take both anchor_every and max_anchors (or neither), got "
+                             f"anchor_every={self.anchor_every!r}, max_anchors={self.max_anchors!r}")
+        if self.anchor_every is not None:
+            for name in ("anchor_every", "max_anchors"):
+                value = getattr(self, name)
+                if not _is_int(value) or value < 1:
+                    raise ValueError(f"{name} must be an int >= 1, got {value!r}")
         for name in ("long_special", "long_patch", "long_frames"):
             value = getattr(self, name)
             if not _is_int(value) or value < 0:
@@ -109,12 +123,31 @@ class CachePolicy:
         return self.recent is None
 
     def budget(self, tokens_per_frame: int, special_count: int) -> Optional[int]:
-        """Most tokens a cache keeps between steps: (1+w)n + m k_U + b_P (b_P = k_P (n-m) with whole frames), or
-        m(1+w+k_U) without patches (register layers: n = m; camera trunk: n = m = 1). None for the full cache."""
+        """Most tokens a cache keeps between steps: (1+n_anchor+w)n + m k_U + b_P (b_P = k_P (n-m) with whole
+        frames), or m(1+n_anchor+w+k_U) without patches (register layers: n = m; camera trunk: n = m = 1). None
+        for the full cache."""
         if self.is_full:
             return None
-        return ((1 + self.recent) * tokens_per_frame + special_count * self.long_special
+        return ((1 + self.extra_anchors + self.recent) * tokens_per_frame + special_count * self.long_special
                 + self.long_patch_capacity(tokens_per_frame - special_count))
+
+    @property
+    def extra_anchors(self) -> int:
+        """n_anchor: the most promoted anchors kept besides frame 1."""
+        return 0 if self.anchor_every is None else self.max_anchors
+
+    def anchor_frames(self, t: int) -> List[int]:
+        """Anchors after the commit of step ``t``: frame 1 and the newest ``max_anchors`` frames 1 + kA <= t."""
+        if self.anchor_every is None:
+            return [1]
+        return [1, *range(1 + self.anchor_every, t + 1, self.anchor_every)[-self.max_anchors:]]
+
+    def protected_frames(self, t: int) -> List[int]:
+        """Frames kept whole after the commit of step ``t`` (ascending): all of them for the full cache, else the
+        anchors and the ``recent`` newest frames."""
+        if self.is_full:
+            return list(range(1, t + 1))
+        return sorted({*self.anchor_frames(t), *range(max(2, t - self.recent + 1), t + 1)})
 
     def long_patch_capacity(self, patches: int) -> int:
         """Most long-patch tokens of a layer with ``patches`` patch tokens per frame: b_P, or k_P whole frames."""
@@ -493,8 +526,7 @@ class LayerKVCache:
         n, m, t = self.tokens_per_frame, self.special_count, self.last_frame
         frame_id, token_id = self.row_ids()
         keys, values = self.read()
-        recent_from = 1 if self.policy.is_full else max(2, t - self.policy.recent + 1)
-        protected_frames = [frame for frame in range(1, t + 1) if frame == 1 or frame >= recent_from]
+        protected_frames = self.policy.protected_frames(t)
         protected = torch.isin(frame_id, torch.tensor(protected_frames, device=frame_id.device))
         special = token_id < m
         long_special_frames, special_counts = torch.unique(frame_id[~protected & special], return_counts=True)
@@ -536,7 +568,7 @@ class LayerKVCache:
         """Rows (bool masks over ``row_ids``) kept after the commit of step ``t``, and the long-patch candidates."""
         policy = self.policy
         frame_id, token_id = self.row_ids()
-        protected = (frame_id == 1) | (frame_id > t - policy.recent)
+        protected = torch.isin(frame_id, torch.tensor(policy.protected_frames(t), device=frame_id.device))
         special = token_id < self.special_count
         long_special, long_patch = ~protected & special, ~protected & ~special
         select_special = torch.unique(frame_id[long_special]).numel() > policy.long_special
@@ -545,27 +577,26 @@ class LayerKVCache:
         else:
             select_patch = int(long_patch.sum()) > policy.long_patch
         keep = protected.clone()
-        if not (select_special or select_patch):  # fewer candidates than the budget: keep them all
-            return keep | long_special | long_patch, long_patch
-        scores = {}  # per selector, computed at most once per commit
+        scores = {}  # per selector, computed at most once per commit, and only when a store must select
 
         def scored(selector: str) -> Tensor:
             if selector not in scores:
                 scores[selector] = self._scores(selector, q, t, grid_hw, long_patch)
             return scores[selector]
 
-        if select_special:  # diversity ranks the patches only: the special tokens keep the query selector
+        # a store keeps every candidate while they fit; a store of size 0 keeps none (nothing to score)
+        if not select_special:
+            keep |= long_special
+        elif policy.long_special > 0:  # diversity ranks the patches only: the special tokens keep the query selector
             special_selector = "query" if policy.selector == "diversity" else policy.selector
             kept_frames = top_frames(scored(special_selector), frame_id, long_special, policy.long_special)
             keep |= long_special & torch.isin(frame_id, kept_frames)
-        else:
-            keep |= long_special
         if not select_patch:
             keep |= long_patch
-        elif policy.long_frames:
+        elif policy.long_frames > 0:
             kept_frames = top_frames(scored(policy.selector), frame_id, long_patch, policy.long_frames)
             keep |= long_patch & torch.isin(frame_id, kept_frames)
-        else:
+        elif policy.long_patch > 0:
             keep[top_rows(scored(policy.selector), frame_id, token_id, long_patch, policy.long_patch)] = True
         return keep, long_patch
 

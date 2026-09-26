@@ -283,6 +283,8 @@ def test_small_bounded_caches_stay_within_budget_over_20_frames(selector, quant)
     dict(recent=1, long_special=1, long_patch=4, selector="diversity", quant="int8"),
     dict(recent=1, long_special=1, long_frames=1, selector="query", quant="int8"),
     dict(recent=1, long_special=2, long_frames=2, selector="diversity", quant="int4"),
+    dict(recent=1, long_special=1, long_frames=1, selector="diversity", quant="int8", anchor_every=4, max_anchors=2),
+    dict(recent=3),  # a sliding window (the W_N control): no long-term store
 ])
 def test_phase5_bounded_caches_stay_within_budget_over_20_frames(policy):
     policy = CachePolicy(**policy)
