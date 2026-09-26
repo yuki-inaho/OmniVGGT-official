@@ -6,6 +6,7 @@
 
 import math
 import numpy as np
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,7 @@ from omnivggt.layers import Mlp
 from omnivggt.layers.block import Block
 from omnivggt.heads.head_act import activate_pose
 from omnivggt.stream.masks import frame_causal_mask
+from omnivggt.stream.visibility import check_frame_visibility
 
 NUM_ITERATIONS = 4  # refinement iterations of CameraHead.forward (the models use the default)
 
@@ -89,7 +91,8 @@ class CameraHead(nn.Module):
             drop=0,
         )
 
-    def forward(self, aggregated_tokens_list: list, num_iterations: int = NUM_ITERATIONS) -> list:
+    def forward(self, aggregated_tokens_list: list, num_iterations: int = NUM_ITERATIONS,
+                frame_visibility: Optional[torch.Tensor] = None) -> list:
         """
         Forward pass to predict camera parameters.
 
@@ -97,6 +100,8 @@ class CameraHead(nn.Module):
             aggregated_tokens_list (list): List of token tensors from the network;
                 the last tensor is used for prediction.
             num_iterations (int, optional): Number of iterative refinement steps. Defaults to 4.
+            frame_visibility (torch.Tensor, optional): [S, S] bool; the trunk attention of frame a sees only the
+                frames b with ``frame_visibility[a, b]`` (see ``omnivggt.stream.visibility``).
 
         Returns:
             list: A list of predicted camera encodings (post-activation) from each iteration.
@@ -108,16 +113,18 @@ class CameraHead(nn.Module):
         pose_tokens = tokens[:, :, 0]
         pose_tokens = self.token_norm(pose_tokens)
 
-        pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations)
+        pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations, frame_visibility)
         return pred_pose_enc_list
 
-    def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int) -> list:
+    def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int,
+                 frame_visibility: Optional[torch.Tensor] = None) -> list:
         """
         Iteratively refine camera pose predictions.
 
         Args:
             pose_tokens (torch.Tensor): Normalized camera tokens with shape [B, 1, C].
             num_iterations (int): Number of refinement iterations.
+            frame_visibility (torch.Tensor, optional): see ``forward``.
 
         Returns:
             list: List of activated camera encodings from each iteration.
@@ -127,11 +134,10 @@ class CameraHead(nn.Module):
         pred_pose_enc_list = []
         if self._stream is not None and S != 1:
             raise ValueError(f"a streaming context runs one frame per call, got {S} frames")
+        attn_mask = self._trunk_mask(S, pose_tokens.device, frame_visibility)
         if self._stream is not None and num_iterations != self._stream.camera_iterations:
             raise ValueError(f"the stream has camera caches for {self._stream.camera_iterations} iterations, "
                              f"got num_iterations={num_iterations}")
-        # one token per frame, so the frame-causal mask is lower-triangular (a stream step needs none)
-        attn_mask = frame_causal_mask(S, 1, pose_tokens.device) if self.causal and self._stream is None else None
 
         for iteration in range(num_iterations):
             # Use a learned empty pose for the first iteration.
@@ -173,6 +179,16 @@ class CameraHead(nn.Module):
             pred_pose_enc_list.append(activated_pose)
 
         return pred_pose_enc_list
+
+    def _trunk_mask(self, S: int, device, frame_visibility: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Attention mask of the trunk. One token per frame: the frame-causal mask is lower-triangular (a stream
+        step needs none), and a frame visibility is its own mask (all-visible runs unmasked)."""
+        if frame_visibility is None:
+            return frame_causal_mask(S, 1, device) if self.causal and self._stream is None else None
+        if self._stream is not None:
+            raise ValueError("a streaming context attends to its KV caches and takes no frame_visibility")
+        check_frame_visibility(frame_visibility, S, self.causal)
+        return None if frame_visibility.all() else frame_visibility.to(device)
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:

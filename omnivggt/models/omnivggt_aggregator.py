@@ -2,7 +2,7 @@ import logging
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 from omnivggt.layers import PatchEmbed
 from omnivggt.layers.block import Block
@@ -11,6 +11,7 @@ from torch.utils.checkpoint import checkpoint
 from omnivggt.utils.geometry import closed_form_inverse_se3
 from omnivggt.models.aggregator import Aggregator, slice_expand_and_flatten
 from omnivggt.stream.masks import frame_causal_mask
+from omnivggt.stream.visibility import check_frame_visibility, visible_frames_block
 
 logger = logging.getLogger(__name__)
 
@@ -368,12 +369,17 @@ class ZeroAggregator(Aggregator):
                 depth: torch.Tensor,
                 mask: torch.Tensor,
                 depth_gt_index: List[int],
-                camera_gt_index: List[int]) -> Tuple[List[torch.Tensor], int]:
+                camera_gt_index: List[int],
+                frame_visibility: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], int]:
+        """``frame_visibility`` ([S, S] bool, optional): query frame a attends only to the key frames b with
+        ``frame_visibility[a, b]`` in every inter-frame block (see ``_visibility_masks``); None keeps the mode's
+        attention (bidirectional, or frame-causal with ``causal=True``)."""
         B, S, C_in, H, W = images.shape
         
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
         self._check_inputs(S, depth_gt_index, camera_gt_index)
+        self._check_frame_visibility(S, frame_visibility)
 
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
@@ -461,8 +467,12 @@ class ZeroAggregator(Aggregator):
         # update P because we added special tokens
         P_old = P
         _, P, C = tokens.shape
-        # of the inter-frame blocks; a stream step needs none: its caches hold only the past and the current frame
-        attn_mask = frame_causal_mask(S, P, tokens.device) if self.causal and self._stream is None else None
+        if frame_visibility is None:
+            # of the inter-frame blocks; a stream step needs none: its caches hold only the past and the current frame
+            attn_mask = frame_causal_mask(S, P, tokens.device) if self.causal and self._stream is None else None
+            visibility = None
+        else:
+            attn_mask, visibility = self._visibility_masks(frame_visibility, S, P, tokens.device)
 
         frame_idx = 0
         global_idx = 0
@@ -477,7 +487,7 @@ class ZeroAggregator(Aggregator):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask
+                        tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask, visibility=visibility
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -488,6 +498,43 @@ class ZeroAggregator(Aggregator):
         del frame_intermediates
         del global_intermediates
         return output_list, self.patch_start_idx
+
+    def _check_frame_visibility(self, S, frame_visibility):
+        if frame_visibility is None:
+            return
+        if self._stream is not None:
+            raise ValueError("a streaming context attends to its KV caches and takes no frame_visibility")
+        check_frame_visibility(frame_visibility, S, self.causal)
+
+    @staticmethod
+    def _visibility_masks(frame_visibility, S, P, device):
+        """(dense mask, gathered visibility) of the inter-frame blocks for a checked ``frame_visibility``.
+
+        All-visible runs unmasked and the full lower triangle is the frame-causal mask: exactly the bidirectional
+        and the causal paths. Any other visibility is gathered per query frame, never as an [S*P, S*P] mask.
+        """
+        if frame_visibility.all():
+            return None, None
+        if torch.equal(frame_visibility, torch.ones_like(frame_visibility).tril()):
+            return frame_causal_mask(S, P, device), None
+        return None, frame_visibility.to(device)
+
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, pose_encoding=None,
+                                  depth_encoding=None, attn_mask=None, visibility=None):
+        """Global blocks as in ``Aggregator``; with ``visibility`` ([S, S], from ``_visibility_masks``) the queries
+        of frame a attend only to the tokens of the frames b with ``visibility[a, b]`` (``visible_frames_block``)."""
+        if visibility is None:
+            return super()._process_global_attention(tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask)
+        if attn_mask is not None:
+            raise ValueError("pass a dense attn_mask or a gathered visibility, not both")
+        tokens = tokens.reshape(B, S * P, C)
+        pos = None if pos is None else pos.reshape(B, S * P, 2)
+        intermediates = []
+        for _ in range(self.aa_block_size):
+            tokens = visible_frames_block(self.global_blocks[global_idx], tokens, visibility, pos=pos)
+            global_idx += 1
+            intermediates.append(tokens.view(B, S, P, C))
+        return tokens, global_idx, intermediates
 
     def _special_tokens(self, B, S):
         """Camera and register tokens, [B*S, X, C]: the reference ones (index 0) for the first frame only.

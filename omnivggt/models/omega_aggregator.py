@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from omnivggt.models.omnivggt_aggregator import ZeroAggregator
+from omnivggt.stream.visibility import frame_visibility_mask
 
 ENCODER_REGISTER_TOKENS = 4  # DINOv2 ViT-L/14-reg, as in the released OmniVGGT weights
 
@@ -51,10 +52,13 @@ class OmegaStyleAggregator(ZeroAggregator):
         return super()._collect_layer(layer_idx, frame_out, global_out) if layer_idx in self.cached_layers else None
 
     def _process_global_attention(
-        self, tokens, B, S, P, C, global_idx, pos=None, pose_encoding=None, depth_encoding=None, attn_mask=None
+        self, tokens, B, S, P, C, global_idx, pos=None, pose_encoding=None, depth_encoding=None, attn_mask=None,
+        visibility=None,
     ):
         if global_idx not in self.register_attention_layers:
-            return super()._process_global_attention(tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask)
+            return super()._process_global_attention(
+                tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask, visibility=visibility
+            )
         prefix = self.patch_start_idx
         tokens = tokens.reshape(B, S, P, C)
         special = tokens[:, :, :prefix].reshape(B, S * prefix, C)
@@ -62,6 +66,8 @@ class OmegaStyleAggregator(ZeroAggregator):
         special_mask = None
         if attn_mask is not None:  # the same inter-frame mask, restricted to the special tokens of every frame
             special_mask = attn_mask.view(S, P, S, P)[:, :prefix, :, :prefix].reshape(S * prefix, S * prefix)
+        if visibility is not None:  # few tokens per frame: the dense [S*m, S*m] mask of the special tokens is small
+            special_mask = frame_visibility_mask(visibility, prefix)
         special = self._run_global_block(global_idx, special, special_pos, special_mask)
         tokens = torch.cat([special.reshape(B, S, prefix, C), tokens[:, :, prefix:]], dim=2)
         return tokens.reshape(B, S * P, C), global_idx + 1, [tokens]
