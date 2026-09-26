@@ -4,6 +4,10 @@ Same inputs, GeoAdapter, camera head and depth head as ``OmniVGGT``. Differences
 the aggregator is ``OmegaStyleAggregator`` (register attention, only head layers cached) and there
 is no point head: ``world_points`` are unprojected from the predicted depth and camera, as in
 VGGT-Omega's single-dense-head design.
+
+``causal=True`` makes the inter-frame attention of the aggregator and the camera-head trunk frame-causal (no
+camera input then); ``depth_norm="first_frame"`` normalises the auxiliary depth by frame 0 (see
+``ZeroAggregator``). Together they make the outputs of frame t independent of the frames after t.
 """
 
 import json
@@ -43,6 +47,8 @@ class OmniVGGTOmega(nn.Module, PyTorchModelHubMixin):
         register_attention_layers=(2, 6, 9, 14, 20),
         global_rope=False,
         cached_layers=(4, 11, 17, 23),
+        causal=False,
+        depth_norm="joint",
         aggregator_kwargs=None,
         camera_head_kwargs=None,
         depth_head_kwargs=None,
@@ -60,9 +66,11 @@ class OmniVGGTOmega(nn.Module, PyTorchModelHubMixin):
             register_attention_layers=tuple(register_attention_layers),
             global_rope=global_rope,
             cached_layers=tuple(cached_layers),
+            causal=causal,
+            depth_norm=depth_norm,
             **(aggregator_kwargs or {}),
         )
-        self.camera_head = CameraHead(dim_in=2 * embed_dim, **(camera_head_kwargs or {}))
+        self.camera_head = CameraHead(dim_in=2 * embed_dim, causal=causal, **(camera_head_kwargs or {}))
         self.depth_head = DPTHead(
             dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1", **(depth_head_kwargs or {})
         )

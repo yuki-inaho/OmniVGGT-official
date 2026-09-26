@@ -1,10 +1,15 @@
 """Frame-causal (batch) OmniVGGTOmega: the inter-frame mask, the aggregator, the camera head and the wiring."""
 
+import json
+import logging
+
 import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from accelerate import PartialState
 
+import train_utils
 from omnivggt.heads.camera_head import CameraHead, modulate
 from omnivggt.heads.head_act import activate_pose
 from omnivggt.models.omnivggt_omega import OmniVGGTOmega
@@ -57,11 +62,10 @@ PAST = slice(0, FRAMES - 1)
 DEPTH_INDEX = {"depth": list(range(FRAMES)), "rgb": []}
 
 
-def _aggregator_model(causal=False, depth_norm="joint", **kwargs):
-    """Tiny fp64 OmniVGGTOmega whose aggregator (only) is configured through aggregator_kwargs."""
+def _model(**kwargs):
+    """Tiny fp64 OmniVGGTOmega in eval mode."""
     torch.manual_seed(0)
-    aggregator_kwargs = {**TINY["aggregator_kwargs"], "causal": causal, "depth_norm": depth_norm}
-    return OmniVGGTOmega(**{**TINY, "aggregator_kwargs": aggregator_kwargs}, **kwargs).double().eval()
+    return OmniVGGTOmega(**TINY, **kwargs).double().eval()
 
 
 def _inputs(seed=0):
@@ -95,7 +99,7 @@ def _infer_aggregator(model, inputs, depth_index, camera_index=()):
 
 @pytest.mark.parametrize("condition", list(DEPTH_INDEX))
 def test_causal_aggregator_past_frames_ignore_the_last_frame(condition):
-    model = _aggregator_model(causal=True, depth_norm="first_frame")
+    model = _model(causal=True, depth_norm="first_frame")
     inputs = _inputs()
     layers, out = _infer_aggregator(model, inputs, DEPTH_INDEX[condition])
     layers_changed, out_changed = _infer_aggregator(model, _with_other_last_frame(inputs), DEPTH_INDEX[condition])
@@ -108,7 +112,7 @@ def test_causal_aggregator_past_frames_ignore_the_last_frame(condition):
 
 @pytest.mark.parametrize("condition", list(DEPTH_INDEX))
 def test_bidirectional_aggregator_past_frames_see_the_last_frame(condition):
-    model = _aggregator_model()
+    model = _model()
     inputs = _inputs()
     layers, _ = _infer_aggregator(model, inputs, DEPTH_INDEX[condition])
     layers_changed, _ = _infer_aggregator(model, _with_other_last_frame(inputs), DEPTH_INDEX[condition])
@@ -116,7 +120,7 @@ def test_bidirectional_aggregator_past_frames_see_the_last_frame(condition):
 
 
 def test_first_frame_normalize_depth_divides_every_view_by_the_frame_0_valid_mean():
-    aggregator = _aggregator_model(depth_norm="first_frame").aggregator
+    aggregator = _model(depth_norm="first_frame").aggregator
     inputs = _inputs()
     depth, mask = inputs["depth"], inputs["mask"]
     mean = depth[0, 0, ..., 0][mask[0, 0] > 0].mean()
@@ -126,7 +130,7 @@ def test_first_frame_normalize_depth_divides_every_view_by_the_frame_0_valid_mea
 
 @pytest.mark.parametrize("depth_norm, frame_0_unchanged", [("first_frame", True), ("joint", False)])
 def test_first_frame_depth_norm_frame_0_ignores_later_depth(depth_norm, frame_0_unchanged):
-    model = _aggregator_model(causal=True, depth_norm=depth_norm)
+    model = _model(causal=True, depth_norm=depth_norm)
     inputs = _inputs()
     scaled = {**inputs, "depth": inputs["depth"].clone()}
     scaled["depth"][:, 1:] *= 2
@@ -137,7 +141,7 @@ def test_first_frame_depth_norm_frame_0_ignores_later_depth(depth_norm, frame_0_
 
 
 def test_first_frame_depth_norm_without_valid_frame_0_depth_raises():
-    model = _aggregator_model(causal=True, depth_norm="first_frame")
+    model = _model(causal=True, depth_norm="first_frame")
     inputs = _inputs()
     inputs["mask"][:, 0] = 0
     with pytest.raises(ValueError, match="frame 0"):
@@ -146,24 +150,24 @@ def test_first_frame_depth_norm_without_valid_frame_0_depth_raises():
 
 @pytest.mark.parametrize("depth_index", [[1, 2], [2, 0, 1]])
 def test_first_frame_depth_norm_needs_frame_0_as_the_first_depth_view(depth_index):
-    model = _aggregator_model(depth_norm="first_frame")
+    model = _model(depth_norm="first_frame")
     with pytest.raises(ValueError, match="frame 0"):
         _infer_aggregator(model, _inputs(), depth_index)
 
 
 def test_unknown_depth_norm_raises():
     with pytest.raises(ValueError, match="depth_norm"):
-        _aggregator_model(depth_norm="median")
+        _model(depth_norm="median")
 
 
 def test_causal_inference_rejects_camera_input():
-    model = _aggregator_model(causal=True)
+    model = _model(causal=True)
     with pytest.raises(ValueError, match="camera"):
         _infer_aggregator(model, _inputs(), [], camera_index=[0])
 
 
 def test_causal_training_rejects_camera_input():
-    model = _aggregator_model(causal=True, depth_norm="first_frame", depth_all_views=True).train()
+    model = _model(causal=True, depth_norm="first_frame", depth_all_views=True).train()
     assert model.aggregator.cam_drop_prob < 1
     with pytest.raises(ValueError, match="cam_drop_prob"):
         model(**_inputs(), modality_rng=np.random.default_rng(0))
@@ -171,13 +175,13 @@ def test_causal_training_rejects_camera_input():
 
 def test_first_frame_training_needs_depth_on_every_view():
     """A random depth subset may leave out frame 0, so the option must hold for every training forward."""
-    model = _aggregator_model(depth_norm="first_frame", cam_drop_prob=1.0).train()
+    model = _model(depth_norm="first_frame", cam_drop_prob=1.0).train()
     with pytest.raises(ValueError, match="depth_all_views"):
         model(**_inputs(), modality_rng=np.random.default_rng(0))
 
 
 def test_causal_training_forward_through_gradient_checkpoints_is_frame_causal():
-    model = _aggregator_model(causal=True, depth_norm="first_frame", cam_drop_prob=1.0, depth_all_views=True).train()
+    model = _model(causal=True, depth_norm="first_frame", cam_drop_prob=1.0, depth_all_views=True).train()
     assert model.aggregator.use_checkpoint  # the training path runs every block under torch.utils.checkpoint
     inputs = _inputs()
     layers, _ = model.aggregator(**inputs, modality_rng=np.random.default_rng(0))
@@ -190,7 +194,7 @@ def test_causal_training_forward_through_gradient_checkpoints_is_frame_causal():
 
 
 def test_aggregator_stream_context_is_unset_by_default():
-    model = _aggregator_model()
+    model = _model()
     assert model.aggregator._stream is None
     model.aggregator._stream = object()  # the streaming context is not implemented at this layer yet
     with pytest.raises(NotImplementedError):
@@ -266,3 +270,101 @@ def test_camera_head_stream_context_is_unset_by_default():
     head._stream = object()  # the streaming context is not implemented at this layer yet
     with pytest.raises(NotImplementedError):
         head([_camera_tokens()])
+
+
+# --- OmniVGGTOmega and train_utils wiring ----------------------------------------------------------------
+
+OUTPUTS = ("pose_enc", "depth", "depth_conf", "world_points")
+
+
+def _infer(model, inputs, depth_index):
+    with torch.no_grad():
+        return model.inference(**inputs, depth_gt_index=list(depth_index), camera_gt_index=[])
+
+
+def test_model_passes_the_options_to_the_aggregator_and_the_camera_head():
+    model = _model(causal=True, depth_norm="first_frame")
+    assert model.aggregator.causal is True and model.camera_head.causal is True
+    assert model.aggregator.depth_norm == "first_frame"
+    default = _model()
+    assert default.aggregator.causal is False and default.camera_head.causal is False
+    assert default.aggregator.depth_norm == "joint"
+    assert list(model.state_dict()) == list(default.state_dict())
+
+
+@pytest.mark.parametrize("condition", list(DEPTH_INDEX))
+def test_causal_model_past_outputs_ignore_the_last_frame(condition):
+    model = _model(causal=True, depth_norm="first_frame")
+    inputs = _inputs()
+    out = _infer(model, inputs, DEPTH_INDEX[condition])
+    out_changed = _infer(model, _with_other_last_frame(inputs), DEPTH_INDEX[condition])
+    for key in OUTPUTS:
+        assert torch.equal(out[key][:, PAST], out_changed[key][:, PAST]), key
+    for pose, pose_changed in zip(out["pose_enc_list"], out_changed["pose_enc_list"], strict=True):
+        assert torch.equal(pose[:, PAST], pose_changed[:, PAST])
+    assert not torch.equal(out["pose_enc"][:, -1], out_changed["pose_enc"][:, -1])
+
+
+@pytest.mark.parametrize("condition", list(DEPTH_INDEX))
+def test_bidirectional_model_past_poses_see_the_last_frame(condition):
+    model = _model()
+    inputs = _inputs()
+    out = _infer(model, inputs, DEPTH_INDEX[condition])
+    out_changed = _infer(model, _with_other_last_frame(inputs), DEPTH_INDEX[condition])
+    assert not torch.equal(out["pose_enc"][:, PAST], out_changed["pose_enc"][:, PAST])
+
+
+def test_from_variant_passes_the_options(tmp_path):
+    variant_keys = ("num_register_tokens", "register_attention_layers", "global_rope", "cached_layers")
+    variant = tmp_path / "tiny.json"
+    variant.write_text(json.dumps({key: TINY[key] for key in variant_keys}))
+    rest = {key: value for key, value in TINY.items() if key not in variant_keys}
+    model = OmniVGGTOmega.from_variant(variant, **rest, causal=True, depth_norm="first_frame")
+    assert model.aggregator.causal is True and model.camera_head.causal is True
+    assert model.aggregator.depth_norm == "first_frame"
+
+
+@pytest.fixture
+def built_kwargs(monkeypatch):
+    PartialState()  # train_utils logs through accelerate
+    built = {}
+
+    def fake_from_variant(path, **kwargs):
+        built.update(kwargs)
+        return OmniVGGTOmega(**TINY, **kwargs)
+
+    monkeypatch.setattr(OmniVGGTOmega, "from_variant", staticmethod(fake_from_variant))
+    return built
+
+
+OMEGA_CFG = {"model_name": "omnivggt_omega", "omega_variant": "configs/omnivggt_omega/variants/V5.json"}
+
+
+def test_build_model_passes_the_options(built_kwargs):
+    model = train_utils.build_model({**OMEGA_CFG, "causal": True, "depth_norm": "first_frame", "cam_drop_prob": 1.0})
+    assert built_kwargs["causal"] is True and built_kwargs["depth_norm"] == "first_frame"
+    assert model.aggregator.causal is True and model.camera_head.causal is True
+    assert model.aggregator.depth_norm == "first_frame"
+    model = train_utils.build_model(OMEGA_CFG)
+    assert built_kwargs["causal"] is False and built_kwargs["depth_norm"] == "joint"
+    assert model.aggregator.causal is False and model.aggregator.depth_norm == "joint"
+
+
+def test_build_model_rejects_a_causal_value_that_is_not_a_bool(built_kwargs):
+    with pytest.raises(ValueError, match="causal"):
+        train_utils.build_model({**OMEGA_CFG, "causal": "0"})
+
+
+@pytest.mark.parametrize("option", [{"causal": True}, {"depth_norm": "first_frame"}])
+def test_build_model_rejects_the_options_for_omnivggt(option):
+    with pytest.raises(ValueError, match="omnivggt_omega"):
+        train_utils.build_model({"model_name": "omnivggt", **option})
+
+
+def test_load_model_logs_the_options(built_kwargs, monkeypatch, caplog):
+    monkeypatch.setattr(train_utils, "load_initial_weights", lambda model, cfg: "none (test)")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+    cfg = {**OMEGA_CFG, "causal": True, "depth_norm": "first_frame", "cam_drop_prob": 1.0}
+    with caplog.at_level(logging.INFO):
+        train_utils.load_model(cfg, torch.device("cpu"))
+    assert "causal=True" in caplog.text and "depth_norm=first_frame" in caplog.text

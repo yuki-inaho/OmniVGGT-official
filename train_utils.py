@@ -223,7 +223,12 @@ def resume_position(checkpoint_name: str, steps_per_epoch: int) -> Tuple[int, in
 def build_model(cfg: Any) -> torch.nn.Module:
     """Instantiate the model named by ``cfg.model_name`` ("omnivggt" by default, or "omnivggt_omega")."""
     name = cfg.get("model_name", "omnivggt")
+    causal, depth_norm = cfg.get("causal", False), cfg.get("depth_norm", "joint")
+    if not isinstance(causal, bool):
+        raise ValueError(f"causal must be true or false, got {causal!r}")
     if name == "omnivggt":
+        if causal or depth_norm != "joint":
+            raise ValueError("causal and depth_norm are options of model_name=omnivggt_omega only")
         return OmniVGGT(enable_point=cfg.get("enable_point", True),
                         enable_depth=cfg.get("enable_depth", True),
                         cam_drop_prob=cfg.get("cam_drop_prob", 0.1),
@@ -236,7 +241,9 @@ def build_model(cfg: Any) -> torch.nn.Module:
         return OmniVGGTOmega.from_variant(_repo_path(variant),
                                           cam_drop_prob=cfg.get("cam_drop_prob", 0.1),
                                           depth_drop_prob=cfg.get("depth_drop_prob", 0.1),
-                                          depth_all_views=cfg.get("depth_all_views", False))
+                                          depth_all_views=cfg.get("depth_all_views", False),
+                                          causal=causal,
+                                          depth_norm=depth_norm)
     raise ValueError(f"unknown model_name {name!r}")
 
 
@@ -331,7 +338,8 @@ def load_model(cfg: Any, device: torch.device) -> Tuple[OmniVGGT, torch.dtype]:
     logger.info(f"Initializing {cfg.get('model_name', 'omnivggt')} model...")
     model = build_model(cfg)
     logger.info(f"cam_drop_prob={model.aggregator.cam_drop_prob} depth_drop_prob={model.aggregator.depth_drop_prob} "
-                f"depth_all_views={getattr(model.aggregator, 'depth_all_views', False)}")
+                f"depth_all_views={getattr(model.aggregator, 'depth_all_views', False)} "
+                f"causal={model.aggregator.causal} depth_norm={model.aggregator.depth_norm}")
 
     # Print network parameters and their indices
     # logger.info("Network parameters and their indices:")
