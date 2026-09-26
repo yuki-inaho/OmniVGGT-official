@@ -381,10 +381,11 @@ class OracleModel:
     """``model.inference`` stand-in that returns the GT cameras and GT depth of the frames it is given."""
 
     def __init__(self):
-        self.calls = []
+        self.calls, self.options = [], []
 
-    def inference(self, images, extrinsics, intrinsics, depth, mask, depth_gt_index, camera_gt_index):
+    def inference(self, images, extrinsics, intrinsics, depth, mask, depth_gt_index, camera_gt_index, **options):
         self.calls.append((images.shape[1], list(depth_gt_index), list(camera_gt_index)))
+        self.options.append(options)
         return {"pose_enc": _pose_enc(extrinsics, *images.shape[-2:]), "depth": depth.clone()}
 
 
@@ -455,6 +456,9 @@ def test_modes_build_the_pre_registered_models(monkeypatch, tmp_path):
         "bidir_f0": {"causal": False, "depth_norm": "first_frame"},
         "bidir_prefix": {"causal": False, "depth_norm": "first_frame"},
         "stream": {"causal": True, "depth_norm": "first_frame"},
+        "causal_batch": {"causal": True, "depth_norm": "first_frame"},
+        "bidir_band": {"causal": False, "depth_norm": "first_frame"},
+        "g2f": {"causal": False, "depth_norm": "first_frame"},  # --g2f-causal: causal True
     }
     built = []
     monkeypatch.setattr(OmniVGGTOmega, "from_variant", staticmethod(lambda path, **options: built.append(options)))
@@ -648,6 +652,7 @@ def test_main_records_provenance_metrics_and_efficiency(monkeypatch, tmp_path, r
     provenance = result["provenance"]
     assert provenance["checkpoint"]["sha256"] == sha256 and provenance["model_config"]["variant"] == {"name": "V9"}
     assert provenance["mode"] == mode and provenance["model_options"] == eval_stream.MODES[mode]
+    assert provenance["mode_arguments"] == {}
     assert provenance["policy"] == ("full" if mode == "stream" else None)
     assert provenance["precision"]["name"] == "fp32" and provenance["precision"]["tf32_matmul"] is False
     assert len(provenance["git"]["commit"]) == 40 and isinstance(provenance["git"]["dirty"], bool)
@@ -682,3 +687,163 @@ def test_mean_over_windows_by_session():
         "s1": {"a": 5.0, "b": 1.0},
         "all": {"a": 3.0},
     }
+
+
+# ---------------------------------------------------------------- phase-5 modes: causal_batch, bidir_band, g2f
+G2F_ARGUMENTS = {"g2f_k": 6, "frame_only_layers": [0, 1, 3, 4, 5], "g2f_causal": False}
+
+
+def test_g2f_k_names_the_pre_registered_layer_sets():
+    import eval_stream
+
+    assert eval_stream.G2F_LAYERS == {3: (0, 1, 3), 6: (0, 1, 3, 4, 5), 9: (0, 1, 3, 4, 5, 7, 8)}
+    for k, layers in eval_stream.G2F_LAYERS.items():  # global layers <= k, without the register layers 2, 6, 9
+        assert layers == tuple(i for i in range(k + 1) if i not in (2, 6, 9))
+
+
+def test_mode_arguments_belong_to_their_mode():
+    import eval_stream
+
+    check = eval_stream.check_mode_arguments
+    for mode in ("bidir", "bidir_f0", "bidir_prefix", "stream", "causal_batch"):
+        assert check(mode) == {}
+    assert check("bidir_band", band_width=4) == {"band_width": 4}
+    assert check("g2f", g2f_k=6) == G2F_ARGUMENTS
+    assert check("g2f", g2f_k=3, g2f_causal=True) == {"g2f_k": 3, "frame_only_layers": [0, 1, 3], "g2f_causal": True}
+    for mode, arguments, match in (
+        ("bidir_band", {}, "band-width"),
+        ("bidir_band", {"band_width": 0}, "band-width"),
+        ("bidir_f0", {"band_width": 4}, "band-width"),
+        ("g2f", {"g2f_k": 3, "band_width": 4}, "band-width"),
+        ("g2f", {}, "g2f-k"),
+        ("g2f", {"g2f_k": 4}, "g2f-k"),
+        ("causal_batch", {"g2f_k": 3}, "g2f-k"),
+        ("bidir", {"g2f_causal": True}, "g2f-causal"),
+        ("bidir_band", {"band_width": 4, "g2f_causal": True}, "g2f-causal"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            check(mode, **arguments)
+
+
+def test_g2f_causal_makes_the_g2f_model_frame_causal():
+    import eval_stream
+
+    assert eval_stream.model_options("g2f", G2F_ARGUMENTS) == {"causal": False, "depth_norm": "first_frame"}
+    causal = {**G2F_ARGUMENTS, "g2f_causal": True}
+    assert eval_stream.model_options("g2f", causal) == {"causal": True, "depth_norm": "first_frame"}
+    assert eval_stream.model_options("bidir_band", {"band_width": 4}) == eval_stream.MODES["bidir_band"]
+    for mode in ("bidir", "stream", "causal_batch"):
+        assert eval_stream.model_options(mode, {}) == eval_stream.MODES[mode]
+
+
+def test_cli_takes_the_mode_arguments():
+    import eval_stream
+
+    parser = eval_stream.build_parser()
+    base = ["--model-config", "V5.json", "--checkpoint", "ckpt", "--roots", "a", "--split", "val", "--preset", "L8"]
+    base += ["--output", "o.json"]
+    args = parser.parse_args([*base, "--mode", "g2f", "--g2f-k", "9", "--g2f-causal"])
+    assert (args.g2f_k, args.g2f_causal, args.band_width) == (9, True, None)
+    args = parser.parse_args([*base, "--mode", "bidir_band", "--band-width", "8"])
+    assert (args.band_width, args.g2f_k, args.g2f_causal) == (8, None, False)
+    for extra in (["--mode", "g2f", "--g2f-k", "4"], ["--mode", "bidir_band", "--band-width", "wide"]):
+        with pytest.raises(SystemExit):
+            parser.parse_args([*base, *extra])
+
+
+def test_batch_modes_pass_their_inference_options(roots):
+    import eval_stream
+    import torch
+
+    from omnivggt.stream.visibility import band_visibility
+
+    _, inputs = _window(roots)
+    model, meter = OracleModel(), eval_stream.Meter("cpu")
+    eval_stream.make_predictor("bidir_band", model, None, "fp32", meter, {"band_width": 2})(inputs, True)
+    eval_stream.make_predictor("g2f", model, None, "fp32", meter, G2F_ARGUMENTS)(inputs, False)
+    eval_stream.make_predictor("causal_batch", model, None, "fp32", meter)(inputs, True)
+    band, g2f, causal = model.options
+    assert list(band) == ["frame_visibility"] and torch.equal(band["frame_visibility"], band_visibility(8, 2))
+    assert g2f == {"frame_only_layers": [0, 1, 3, 4, 5]} and causal == {}
+    assert model.calls == [(8, list(range(8)), []), (8, [], []), (8, list(range(8)), [])]
+    for mode in ("bidir_band", "g2f"):
+        with pytest.raises(ValueError, match="argument"):
+            eval_stream.make_predictor(mode, model, None, "fp32", meter)
+
+
+@pytest.mark.parametrize("use_depth", [True, False])
+def test_causal_batch_mode_equals_the_full_cache_stream(use_depth):
+    import eval_stream
+    import torch
+    from test_stream_causal import _inputs, _model
+
+    model, inputs = _model(causal=True, depth_norm="first_frame"), _inputs()
+    meter = eval_stream.Meter("cpu")
+    batch = eval_stream.make_predictor("causal_batch", model, None, "fp32", meter)(inputs, use_depth)
+    stream = eval_stream.make_predictor("stream", model, "full", "fp32", meter)(inputs, use_depth)
+    assert len(batch["step_ms"]) == 1 and "kv_bytes" not in batch and len(stream["step_ms"]) == 4
+    # a fp32 stream cache under the fp64 tiny model, and fp32 predictions: the tolerance is fp32 rounding
+    torch.testing.assert_close(batch["pose_enc"], stream["pose_enc"], atol=1e-6, rtol=0)
+    torch.testing.assert_close(batch["depth"], stream["depth"], atol=1e-6, rtol=1e-6)
+
+
+def test_band_and_g2f_modes_run_the_model_with_their_options():
+    import eval_stream
+    import torch
+    from test_stream_causal import _inputs, _model
+
+    from omnivggt.stream.visibility import band_visibility
+
+    model, inputs = _model(depth_norm="first_frame"), _inputs()
+    meter = eval_stream.Meter("cpu")
+    tiny_g2f = {"g2f_k": 3, "frame_only_layers": [0, 2], "g2f_causal": False}  # TINY's layer 1 is a register layer
+    band = eval_stream.make_predictor("bidir_band", model, None, "fp32", meter, {"band_width": 1})(inputs, True)
+    g2f = eval_stream.make_predictor("g2f", model, None, "fp32", meter, tiny_g2f)(inputs, True)
+    views = {"depth_gt_index": [0, 1, 2, 3], "camera_gt_index": []}
+    with torch.no_grad():
+        want_band = model.inference(**inputs, **views, frame_visibility=band_visibility(4, 1))
+        want_g2f = model.inference(**inputs, **views, frame_only_layers=[0, 2])
+        default = model.inference(**inputs, **views)
+    for got, want in ((band, want_band), (g2f, want_g2f)):
+        assert torch.equal(got["pose_enc"], want["pose_enc"].float())
+        assert torch.equal(got["depth"], want["depth"].float())
+        assert not torch.equal(got["pose_enc"], default["pose_enc"].float())
+
+
+@pytest.mark.parametrize(
+    "mode, extra, arguments, options",
+    [
+        ("causal_batch", [], {}, {"causal": True, "depth_norm": "first_frame"}),
+        ("bidir_band", ["--band-width", "4"], {"band_width": 4}, {"causal": False, "depth_norm": "first_frame"}),
+        ("g2f", ["--g2f-k", "6"], G2F_ARGUMENTS, {"causal": False, "depth_norm": "first_frame"}),
+        (
+            "g2f",
+            ["--g2f-k", "3", "--g2f-causal"],
+            {"g2f_k": 3, "frame_only_layers": [0, 1, 3], "g2f_causal": True},
+            {"causal": True, "depth_norm": "first_frame"},
+        ),
+    ],
+)
+def test_main_records_the_mode_arguments(monkeypatch, tmp_path, roots, mode, extra, arguments, options):
+    result, built, _ = _run_main(monkeypatch, tmp_path, roots, ["--windows", "s0:12-19", "--mode", mode, *extra])
+    assert [model_options for *_, model_options in built] == [options]
+    provenance = result["provenance"]
+    assert provenance["mode"] == mode and provenance["mode_arguments"] == arguments
+    assert provenance["model_options"] == options and provenance["policy"] is None
+    assert result["windows"][0]["conditions"]["depth"]["metrics"]["ate_g1_rmse_mm"] < 1e-3
+
+
+def test_main_rejects_the_arguments_of_other_modes(tmp_path):
+    import eval_stream
+
+    output = tmp_path / "result.json"
+    argv = ["--model-config", "V5.json", "--checkpoint", "ckpt", "--roots", "a", "--split", "val", "--preset", "L8"]
+    argv += ["--device", "cpu", "--output", str(output)]
+    for extra, match in (
+        (["--mode", "bidir_f0", "--band-width", "4"], "band-width"),
+        (["--mode", "g2f"], "g2f-k"),
+        (["--mode", "stream", "--policy", "full", "--g2f-causal"], "g2f-causal"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            eval_stream.main([*argv, *extra])
+    assert not output.exists()

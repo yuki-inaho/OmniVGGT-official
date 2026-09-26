@@ -10,7 +10,12 @@ Modes (the model options each one builds are in ``MODES``):
 * ``bidir``: one bidirectional forward over the window (depth input normalised jointly);
 * ``bidir_f0``: ``bidir`` with the depth input normalised by the first frame only;
 * ``bidir_prefix``: frame t is the last frame of a ``bidir_f0`` forward over frames 1..t (online, O(t^2));
-* ``stream``: the frame-causal model fed one frame at a time (``StreamingOmega`` with ``--policy``).
+* ``stream``: the frame-causal model fed one frame at a time (``StreamingOmega`` with ``--policy``);
+* ``causal_batch``: one forward of the frame-causal model over the window (equals ``stream`` with a full cache);
+* ``bidir_band``: ``bidir_f0`` where frame a sees only frame 0 and the frames b with |a - b| <= ``--band-width``
+  (a frame visibility; no dense token mask is built);
+* ``g2f``: ``bidir_f0`` whose global layers ``G2F_LAYERS[--g2f-k]`` attend within each frame only; with
+  ``--g2f-causal`` the model is frame-causal (as ``causal_batch``).
 
 Conditions: ``depth`` gives GT depth for every frame, ``rgb`` none; cameras are never given. Metrics are
 ``stream_metrics.window_metrics`` per window, plus window means per session. Efficiency: per-step latency
@@ -21,7 +26,8 @@ autocast and a bf16 stream cache (efficiency only).
 
 usage: PYTHONPATH=tools uv run python -m eval_stream --model-config VARIANT.json --checkpoint W|DIR \
            --roots R0 R1 --split {val,smoke} (--windows "s0:950-981,s1:950-981" | --preset L8) \
-           --mode {bidir,bidir_f0,bidir_prefix,stream} [--policy full|JSON] [--conditions depth rgb] \
+           --mode {bidir,bidir_f0,bidir_prefix,stream,causal_batch,bidir_band,g2f} [--policy full|JSON] \
+           [--band-width W] [--g2f-k {3,6,9} [--g2f-causal]] [--conditions depth rgb] \
            [--precision fp32|bf16] --output result.json
 """
 
@@ -56,7 +62,12 @@ MODES = {
     "bidir_f0": {"causal": False, "depth_norm": "first_frame"},
     "bidir_prefix": {"causal": False, "depth_norm": "first_frame"},
     "stream": {"causal": True, "depth_norm": "first_frame"},
+    "causal_batch": {"causal": True, "depth_norm": "first_frame"},
+    "bidir_band": {"causal": False, "depth_norm": "first_frame"},
+    "g2f": {"causal": False, "depth_norm": "first_frame"},  # --g2f-causal: causal True
 }
+# --g2f-k k: the global layers <= k that attend within the frame; the register layers (2, 6, 9) are left out
+G2F_LAYERS = {3: (0, 1, 3), 6: (0, 1, 3, 4, 5), 9: (0, 1, 3, 4, 5, 7, 8)}
 CONDITIONS = ("depth", "rgb")
 PRECISIONS = ("fp32", "bf16")
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
@@ -165,6 +176,38 @@ def check_options(mode: str, policy: str | None):
     return parsed
 
 
+def check_mode_arguments(mode: str, band_width: int | None = None, g2f_k: int | None = None,
+                         g2f_causal: bool = False) -> dict:
+    """The mode arguments as the provenance records them: ``{"band_width": w}`` (required by ``bidir_band``),
+    ``{"g2f_k": k, "frame_only_layers": G2F_LAYERS[k], "g2f_causal": ...}`` (``g2f``; k required) or ``{}``.
+    Every other mode refuses them."""
+    if mode == "bidir_band":
+        if not isinstance(band_width, int) or isinstance(band_width, bool) or band_width < 1:
+            raise ValueError(f"--mode bidir_band needs --band-width, an int >= 1, got {band_width!r}")
+    elif band_width is not None:
+        raise ValueError(f"--band-width applies to --mode bidir_band only, not {mode}")
+    if mode == "g2f":
+        if g2f_k not in G2F_LAYERS:
+            raise ValueError(f"--mode g2f needs --g2f-k from {sorted(G2F_LAYERS)}, got {g2f_k!r}")
+    elif g2f_k is not None or g2f_causal:
+        raise ValueError(f"{'--g2f-k' if g2f_k is not None else '--g2f-causal'} applies to --mode g2f only, "
+                         f"not {mode}")
+    if mode == "bidir_band":
+        return {"band_width": band_width}
+    if mode == "g2f":
+        return {"g2f_k": g2f_k, "frame_only_layers": list(G2F_LAYERS[g2f_k]), "g2f_causal": g2f_causal}
+    return {}
+
+
+def model_options(mode: str, arguments: dict) -> dict:
+    """The options the model of ``mode`` is built with (``MODES``); ``--g2f-causal`` makes the g2f model
+    frame-causal."""
+    options = dict(MODES[mode])
+    if mode == "g2f" and arguments["g2f_causal"]:
+        options["causal"] = True
+    return options
+
+
 def precision_setup(precision: str, device):
     """(context, record): TF32 off for every precision; ``bf16`` adds bf16 autocast."""
     if precision not in PRECISIONS:
@@ -244,8 +287,9 @@ def window_inputs(item: dict, device) -> dict:
     }
 
 
-def _inference(model, inputs: dict, frames: slice, use_depth: bool) -> dict:
-    """``model.inference`` on the window ``frames``: GT depth for every view or none, never cameras."""
+def _inference(model, inputs: dict, frames: slice, use_depth: bool, **options) -> dict:
+    """``model.inference`` on the window ``frames``: GT depth for every view or none, never cameras; ``options``
+    (``frame_visibility``, ``frame_only_layers``) are passed on."""
     views = {key: value[:, frames] for key, value in inputs.items()}
     count = views["images"].shape[1]
     return model.inference(
@@ -256,6 +300,7 @@ def _inference(model, inputs: dict, frames: slice, use_depth: bool) -> dict:
         mask=views["mask"],
         depth_gt_index=list(range(count)) if use_depth else [],
         camera_gt_index=[],
+        **options,
     )
 
 
@@ -263,10 +308,22 @@ def _on_cpu(prediction: dict) -> dict:
     return {"pose_enc": prediction["pose_enc"].float().cpu(), "depth": prediction["depth"].float().cpu()}
 
 
-def predict_batch(model, inputs: dict, use_depth: bool, meter: Meter) -> dict:
-    """``bidir`` / ``bidir_f0``: one forward over the whole window."""
+def predict_batch(model, inputs: dict, use_depth: bool, meter: Meter, band_width: int | None = None,
+                  frame_only_layers: list[int] | None = None) -> dict:
+    """``bidir`` / ``bidir_f0`` / ``causal_batch`` / ``bidir_band`` / ``g2f``: one forward over the whole window,
+    under the band frame visibility of ``band_width`` or with ``frame_only_layers`` when given."""
+    options = {}
+    if band_width is not None:
+        from omnivggt.stream.visibility import band_visibility
+
+        images = inputs["images"]
+        options["frame_visibility"] = band_visibility(images.shape[1], band_width, images.device)
+    if frame_only_layers is not None:
+        options["frame_only_layers"] = frame_only_layers
     meter.start()
-    prediction, milliseconds = meter.timed(functools.partial(_inference, model, inputs, slice(None), use_depth))
+    prediction, milliseconds = meter.timed(
+        functools.partial(_inference, model, inputs, slice(None), use_depth, **options)
+    )
     prediction = _on_cpu(prediction)
     return {**prediction, "step_ms": [milliseconds], "memory": meter.memory()}
 
@@ -330,12 +387,19 @@ def make_streamer(model, policy, precision: str):
     return StreamingOmega(model, cache_policy, DTYPES[precision])
 
 
-def make_predictor(mode: str, model, policy, precision: str, meter: Meter):
-    """``predictor(inputs, use_depth) -> prediction`` of one mode."""
+def make_predictor(mode: str, model, policy, precision: str, meter: Meter, arguments: dict | None = None):
+    """``predictor(inputs, use_depth) -> prediction`` of one mode; ``arguments`` are its ``check_mode_arguments``
+    (required by ``bidir_band`` and ``g2f``)."""
+    if mode in ("bidir_band", "g2f") and arguments is None:
+        raise ValueError(f"--mode {mode} needs its mode arguments (check_mode_arguments)")
     if mode == "stream":
         return functools.partial(predict_stream, make_streamer(model, policy, precision), meter=meter)
     if mode == "bidir_prefix":
         return functools.partial(predict_prefix, model, meter=meter)
+    if mode == "bidir_band":
+        return functools.partial(predict_batch, model, meter=meter, band_width=arguments["band_width"])
+    if mode == "g2f":
+        return functools.partial(predict_batch, model, meter=meter, frame_only_layers=arguments["frame_only_layers"])
     return functools.partial(predict_batch, model, meter=meter)
 
 
@@ -386,6 +450,9 @@ def build_parser() -> argparse.ArgumentParser:
     windows.add_argument("--preset", choices=["L8"])
     parser.add_argument("--mode", choices=list(MODES), required=True)
     parser.add_argument("--policy", help='stream only: "full" or a CachePolicy JSON object')
+    parser.add_argument("--band-width", type=int, help="bidir_band only: frame a sees frame 0 and |a - b| <= W")
+    parser.add_argument("--g2f-k", type=int, choices=sorted(G2F_LAYERS), help="g2f only: frame-only G2F_LAYERS[k]")
+    parser.add_argument("--g2f-causal", action="store_true", help="g2f only: the frame-causal model")
     parser.add_argument("--conditions", nargs="+", choices=CONDITIONS, default=["depth"])
     parser.add_argument("--precision", choices=PRECISIONS, default="fp32")
     parser.add_argument("--resolution", type=int, nargs=2, default=(392, 294), metavar=("W", "H"))
@@ -397,6 +464,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     policy = check_options(args.mode, args.policy)
+    arguments = check_mode_arguments(args.mode, args.band_width, args.g2f_k, args.g2f_causal)
+    options = model_options(args.mode, arguments)
     if args.output.exists():
         raise FileExistsError(args.output)
     loader = WindowLoader(args.roots, args.split, args.resolution)
@@ -407,9 +476,9 @@ def main(argv=None) -> int:
     for window in windows:
         loader.anchor(window)  # every window is checked before the model is loaded
     variant_provenance = _check_variant_provenance(args.model_config, args.checkpoint)
-    model, weights = _load_model(args.checkpoint, args.device, args.model_config, **MODES[args.mode])
+    model, weights = _load_model(args.checkpoint, args.device, args.model_config, **options)
     context, precision = precision_setup(args.precision, args.device)
-    predictor = make_predictor(args.mode, model, policy, args.precision, Meter(args.device))
+    predictor = make_predictor(args.mode, model, policy, args.precision, Meter(args.device), arguments)
 
     records = []
     start = time.time()
@@ -426,7 +495,8 @@ def main(argv=None) -> int:
             "model_config": _model_config_record(args.model_config),
             "variant_provenance": variant_provenance,
             "mode": args.mode,
-            "model_options": MODES[args.mode],
+            "mode_arguments": arguments,
+            "model_options": options,
             "policy": policy,
             "precision": precision,
             "git": git_state(),
