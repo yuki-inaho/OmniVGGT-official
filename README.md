@@ -429,6 +429,38 @@ depending on the recipe; 2 of the 24 checks still fail in the best runs), so the
 was not passed; the longer runs also train more than the baseline, so they are not an equal-budget comparison. A control run with the original inter-frame attention but no point head and the depth-derived
 point loss matched the baseline (AbsRel 0.055), so the gap comes from the inter-frame attention change,
 not from removing the point head; that configuration alone is 1.13-1.16x faster.
+Restricted afterwards to the conditions with depth input (RGB-D is a required input in our use;
+`configs/omnivggt_omega/equivalence_thresholds_rgbd.json`, same thresholds), the AMUSE run and the longer runs pass
+all 12 checks at 392x294, while the baseline recipe fails 2.
+
+**High-resolution RGB-D fine-tuning.** For RGB-D-only use, training can give the auxiliary depth to every view and
+continue from a trained OmniVGGTOmega checkpoint of the same variant at a higher resolution (resolutions must be
+multiples of 14; the micro-batch count per epoch must be a multiple of the accumulation):
+
+```bash
+# 640x480 staging images trained at 644x476 (46x34 patches); 4 images per micro-batch x 3 = 12 images per step
+export OMNIVGGT_COLMAP_RGBD_ROOTS=/path/staging_640_a,/path/staging_640_b
+export OMNIVGGT_OMEGA_VARIANT=configs/omnivggt_omega/variants/V5.json
+export OMNIVGGT_INIT_CHECKPOINT=/path/runs/omega_V5_best/omnivggt-omega-colmap-rgbd/final_checkpoint
+export OMNIVGGT_RESOLUTION=644x476 OMNIVGGT_DEPTH_ALL_VIEWS=1 OMNIVGGT_DEPTH_DROP_PROB=0
+export OMNIVGGT_TRAIN_BATCH_IMAGES=4 OMNIVGGT_GRAD_ACCUM=3 OMNIVGGT_STEPS_PER_EPOCH=4680  # 2 epochs x 1,560 steps
+export OMNIVGGT_OPTIMIZER=amuse OMNIVGGT_PATCH_EMBED_FREEZE=0 OMNIVGGT_OUTPUT_DIR=/path/runs/omega_V5_hr
+uv run accelerate launch --num_processes 1 --mixed_precision bf16 \
+  train_omnivggt.py --config configs/train_colmap_rgbd_omega.py
+```
+
+Evaluate with `--resolution 644 476` and the RGB-D thresholds; `bench_inference --condition depth` times the
+RGB-D path. Starting from the best 392x294 run above (AMUSE, twice the steps, trainable encoder) and evaluated on
+the validation split at 644x476 against the fine-tuned OmniVGGT evaluated the same way, all 12 RGB-D checks pass:
+depth AbsRel 0.0077 vs 0.019-0.021 and camera AUC@30 0.984 vs 0.981 (RGB-D) and 0.999 vs 0.969 (RGB-D with
+camera). This is an additional check, not an equal-budget comparison (different training resolution, three times
+the total steps, depth always given, trainable encoder). Inference at 644x476 with depth input is 1.28-1.29x faster
+(314 / 757 / 1964 ms vs 406 / 977 / 2505 ms for 8 / 16 / 32 frames; peak activations 4948 / 5411 / 6336 vs
+6928 / 9383 / 14291 MiB). Because the model was trained with depth on every view, its RGB-only depth is much worse
+(AbsRel 0.144 vs 0.050), so use it with depth input only. The depth evaluation uses the same mapped depth as input
+and ground truth (about half of its valid pixels are filled by the 3x3 dilation) and aligns the scale to the ground
+truth, so these depth numbers include the benefit of passing the input depth through and do not test metric scale.
+Training at 644x476 saw at most 4 views per sample, fewer than the 8-frame evaluation clips.
 
 ## 📝 To-Do List
 
