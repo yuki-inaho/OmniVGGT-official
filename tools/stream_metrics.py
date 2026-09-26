@@ -155,3 +155,19 @@ def window_metrics(
     metrics.update(depth_report(pred_depth, gt_depth, mask, s1))
     metrics.update(pose_metrics(pred_w2c, gt_w2c))
     return {"metrics": metrics, "series": series}
+
+
+def _mean_metrics(metrics: list[dict]) -> dict:
+    """Mean of every metric that all of ``metrics`` report."""
+    keys = [key for key in metrics[0] if all(key in m for m in metrics)]
+    return {key: float(np.mean([m[key] for m in metrics])) for key in keys}
+
+
+def mean_over_windows(windows: list[dict], condition: str) -> dict:
+    """Window-mean metrics of ``condition`` per session and over all windows (``"all"``)."""
+    by_session = {}
+    for window in windows:
+        by_session.setdefault(window["session"], []).append(window["conditions"][condition]["metrics"])
+    means = {session: _mean_metrics(metrics) for session, metrics in by_session.items()}
+    means["all"] = _mean_metrics([window["conditions"][condition]["metrics"] for window in windows])
+    return means

@@ -74,15 +74,46 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _build_model(model_config):
-    """OmniVGGT, or the OmniVGGTOmega variant described by ``model_config`` (a variant JSON)."""
+def sequential_dataset(roots, split: str, resolution, stride: int):
+    """The evaluation dataset: ``ColmapRgbd`` sequential views, ``stride`` frames apart, no augmentation."""
+    from omnivggt.datasets.colmap_rgbd import ColmapRgbd
+    from omnivggt.datasets.utils.transforms import ImgNorm
+
+    return ColmapRgbd(
+        roots=roots,
+        split=split,
+        resolution=[tuple(resolution)],
+        transform=ImgNorm,
+        aug_crop=0,
+        seed=1,
+        view_selection="sequential",
+        sequential_stride=stride,
+    )
+
+
+def sequential_anchors(dataset, frames: int, stride: int, num_samples: int) -> list[int]:
+    """``num_samples`` evenly spaced anchors whose ``frames`` sequential views stay inside one scene."""
+    span = (frames - 1) * stride
+    valid = [
+        i
+        for i in range(len(dataset))
+        if i + span < len(dataset) and dataset.scene_labels[i + span] == dataset.scene_labels[i]
+    ]
+    return [valid[k] for k in np.linspace(0, len(valid) - 1, num_samples).round().astype(int)]
+
+
+def _build_model(model_config, **model_options):
+    """OmniVGGT, or the OmniVGGTOmega variant described by ``model_config`` (a variant JSON) built with
+    ``model_options`` (e.g. ``causal``, ``depth_norm``)."""
     if model_config is None:
+        if model_options:
+            raise ValueError(f"model options {sorted(model_options)} need an OmniVGGTOmega variant")
         from omnivggt.models import omnivggt
 
         return omnivggt.OmniVGGT()
     from omnivggt.models.omnivggt_omega import OmniVGGTOmega
 
-    return OmniVGGTOmega.from_variant(model_config)
+    return OmniVGGTOmega.from_variant(model_config, **model_options)
 
 
 def _model_config_record(model_config):
@@ -106,13 +137,13 @@ def _check_variant_provenance(model_config, checkpoint: Path):
     return "verified"
 
 
-def _load_model(checkpoint: Path, device: str, model_config=None):
+def _load_model(checkpoint: Path, device: str, model_config=None, **model_options):
     from safetensors.torch import load_file
 
     path = checkpoint / "model.safetensors" if checkpoint.is_dir() else checkpoint
     if not path.is_file():
         raise FileNotFoundError(path)
-    model = _build_model(model_config)
+    model = _build_model(model_config, **model_options)
     model.load_state_dict(load_file(str(path)), strict=True)
     return model.to(device).eval(), path
 
@@ -134,27 +165,10 @@ def main() -> int:
 
     import torch
 
-    from omnivggt.datasets.colmap_rgbd import ColmapRgbd
-    from omnivggt.datasets.utils.transforms import ImgNorm
     from omnivggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    dataset = ColmapRgbd(
-        roots=args.roots,
-        split=args.split,
-        resolution=[tuple(args.resolution)],
-        transform=ImgNorm,
-        aug_crop=0,
-        seed=1,
-        view_selection="sequential",
-        sequential_stride=args.stride,
-    )
-    span = (args.frames - 1) * args.stride
-    valid = [
-        i
-        for i in range(len(dataset))
-        if i + span < len(dataset) and dataset.scene_labels[i + span] == dataset.scene_labels[i]
-    ]
-    anchors = [valid[k] for k in np.linspace(0, len(valid) - 1, args.num_samples).round().astype(int)]
+    dataset = sequential_dataset(args.roots, args.split, args.resolution, args.stride)
+    anchors = sequential_anchors(dataset, args.frames, args.stride, args.num_samples)
     variant_provenance = _check_variant_provenance(args.model_config, args.checkpoint)
     model, weights = _load_model(args.checkpoint, "cuda", args.model_config)
 
