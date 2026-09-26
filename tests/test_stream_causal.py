@@ -3,7 +3,10 @@
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
+from omnivggt.heads.camera_head import CameraHead, modulate
+from omnivggt.heads.head_act import activate_pose
 from omnivggt.models.omnivggt_omega import OmniVGGTOmega
 from omnivggt.stream.masks import frame_causal_mask
 
@@ -192,3 +195,74 @@ def test_aggregator_stream_context_is_unset_by_default():
     model.aggregator._stream = object()  # the streaming context is not implemented at this layer yet
     with pytest.raises(NotImplementedError):
         _infer_aggregator(model, _inputs(), [])
+
+
+# --- camera head: frame-causal trunk ---------------------------------------------------------------------
+
+
+def _camera_head(causal=False):
+    torch.manual_seed(0)
+    return CameraHead(dim_in=64, trunk_depth=2, num_heads=2, causal=causal).double().eval()
+
+
+def _camera_tokens(seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randn(2, FRAMES, 3, 64, generator=generator, dtype=torch.float64)  # [B, S, P, C]
+
+
+def _pose_list_through_sequential(head, tokens, num_iterations=4):
+    """CameraHead.forward as written before its trunk became an explicit loop: ``head.trunk`` called as a whole."""
+    pose_tokens = head.token_norm(tokens[:, :, 0])
+    batch, frames, _ = pose_tokens.shape
+    pred, poses = None, []
+    for _ in range(num_iterations):
+        pose = head.empty_pose_tokens.expand(batch, frames, -1) if pred is None else pred.detach()
+        shift, scale, gate = head.poseLN_modulation(head.embed_pose(pose)).chunk(3, dim=-1)
+        modulated = gate * modulate(head.adaln_norm(pose_tokens), shift, scale) + pose_tokens
+        delta = head.pose_branch(head.trunk_norm(head.trunk(modulated)))
+        pred = delta if pred is None else pred + delta
+        poses.append(activate_pose(pred, trans_act=head.trans_act, quat_act=head.quat_act, fl_act=head.fl_act))
+    return poses
+
+
+def test_camera_head_default_output_is_bitwise_the_sequential_trunk():
+    head, tokens = _camera_head(), _camera_tokens()
+    with torch.no_grad():
+        for got, want in zip(head([tokens]), _pose_list_through_sequential(head, tokens), strict=True):
+            assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("causal", [True, False])
+def test_camera_head_past_poses_ignore_the_last_frame_only_when_causal(causal):
+    head, tokens = _camera_head(causal), _camera_tokens()
+    changed = tokens.clone()
+    changed[:, -1] = _camera_tokens(seed=1)[:, -1]
+    with torch.no_grad():
+        poses, poses_changed = head([tokens]), head([changed])
+    for pose, pose_changed in zip(poses, poses_changed, strict=True):
+        assert torch.equal(pose[:, PAST], pose_changed[:, PAST]) is causal
+        assert not torch.equal(pose[:, -1], pose_changed[:, -1])
+
+
+def test_causal_camera_head_frame_t_equals_the_head_on_frames_up_to_t():
+    head, tokens = _camera_head(causal=True), _camera_tokens()
+    with torch.no_grad():
+        whole = head([tokens])[-1]
+        for frame in range(FRAMES):
+            prefix = head([tokens[:, : frame + 1]])[-1]
+            torch.testing.assert_close(prefix[:, frame], whole[:, frame], rtol=0, atol=1e-12)
+
+
+def test_camera_head_keeps_the_sequential_trunk_and_state_dict_keys():
+    head, causal = _camera_head(), _camera_head(causal=True)
+    assert isinstance(causal.trunk, nn.Sequential) and len(causal.trunk) == 2
+    assert list(causal.state_dict()) == list(head.state_dict())
+    causal.load_state_dict(head.state_dict(), strict=True)
+
+
+def test_camera_head_stream_context_is_unset_by_default():
+    head = _camera_head()
+    assert head._stream is None
+    head._stream = object()  # the streaming context is not implemented at this layer yet
+    with pytest.raises(NotImplementedError):
+        head([_camera_tokens()])

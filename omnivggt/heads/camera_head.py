@@ -14,13 +14,15 @@ import torch.nn.functional as F
 from omnivggt.layers import Mlp
 from omnivggt.layers.block import Block
 from omnivggt.heads.head_act import activate_pose
+from omnivggt.stream.masks import frame_causal_mask
 
 
 class CameraHead(nn.Module):
     """
     CameraHead predicts camera parameters from token representations using iterative refinement.
 
-    It applies a series of transformer blocks (the "trunk") to dedicated camera tokens.
+    It applies a series of transformer blocks (the "trunk") to dedicated camera tokens, one per frame.
+    With ``causal=True`` the trunk attention is frame-causal (lower-triangular): frame a sees frames b <= a.
     """
 
     def __init__(
@@ -34,6 +36,7 @@ class CameraHead(nn.Module):
         trans_act: str = "linear",
         quat_act: str = "linear",
         fl_act: str = "relu",  # Field of view activations: ensures FOV values are positive.
+        causal: bool = False,
     ):
         super().__init__()
 
@@ -46,6 +49,8 @@ class CameraHead(nn.Module):
         self.quat_act = quat_act
         self.fl_act = fl_act
         self.trunk_depth = trunk_depth
+        self.causal = causal
+        self._stream = None  # streaming context (omnivggt.stream); None runs whole batches
 
         # Build the trunk using a sequence of transformer blocks.
         self.trunk = nn.Sequential(
@@ -92,6 +97,8 @@ class CameraHead(nn.Module):
         Returns:
             list: A list of predicted camera encodings (post-activation) from each iteration.
         """
+        if self._stream is not None:
+            raise NotImplementedError("a streaming context is set, but this camera head only runs whole batches")
         # Use tokens from the last block for camera prediction.
         tokens = aggregated_tokens_list[-1]
 
@@ -116,6 +123,8 @@ class CameraHead(nn.Module):
         B, S, C = pose_tokens.shape  # S is expected to be 1.
         pred_pose_enc = None
         pred_pose_enc_list = []
+        # one token per frame, so the frame-causal mask is lower-triangular
+        attn_mask = frame_causal_mask(S, 1, pose_tokens.device) if self.causal else None
 
         for _ in range(num_iterations):
             # Use a learned empty pose for the first iteration.
@@ -133,7 +142,8 @@ class CameraHead(nn.Module):
             pose_tokens_modulated = gate_msa * modulate(self.adaln_norm(pose_tokens), shift_msa, scale_msa)
             pose_tokens_modulated = pose_tokens_modulated + pose_tokens
 
-            pose_tokens_modulated = self.trunk(pose_tokens_modulated)
+            for block in self.trunk:  # an explicit loop over the Sequential, so that every block takes the mask
+                pose_tokens_modulated = block(pose_tokens_modulated, attn_mask=attn_mask)
             # Compute the delta update for the pose encoding.
             pred_pose_enc_delta = self.pose_branch(self.trunk_norm(pose_tokens_modulated))
 
