@@ -24,6 +24,10 @@ codes and block scale/offset until it is evicted; the other parts stay in the ca
 
 A retrieve policy (``retrieve_frames``) is applied by ``StreamingOmega`` (``omnivggt.stream.retrieve``): its caches
 are full caches, and each step reads only the frames the retrieval selected (``LayerKVCache.read(frames)``).
+
+The stored keys and values are always detached. Training on the stream reads the current frame's keys and values
+with their gradient in place of its stored rows (``LayerKVCache.read(current=...)``): the gradient of a step goes
+through the current frame only.
 """
 
 import math
@@ -476,7 +480,8 @@ class LayerKVCache:
         return 0 if self._quant is None else self._quant.rows
 
     def append(self, k: Tensor, v: Tensor, frame_id: int) -> None:
-        """Write the current frame's keys and values ([B, H, n, D]) after the stored rows."""
+        """Write the current frame's keys and values ([B, H, n, D]) after the stored rows, detached: the cache
+        never holds an autograd graph (training reads the current frame with ``read(current=...)``)."""
         if self._pending is not None:
             raise RuntimeError(f"frame {self._pending} was appended but not committed: commit before the next append")
         if frame_id != self.last_frame + 1:
@@ -493,20 +498,28 @@ class LayerKVCache:
             raise ValueError(f"keys of shape {tuple(k.shape)} do not match the cache {tuple(self._keys.shape)}")
         self._reserve(self._rows + self.tokens_per_frame)
         rows = slice(self._rows, self._rows + self.tokens_per_frame)
-        self._keys[:, :, rows] = k.to(self.dtype)
-        self._values[:, :, rows] = v.to(self.dtype)
+        self._keys[:, :, rows] = k.detach().to(self.dtype)
+        self._values[:, :, rows] = v.detach().to(self.dtype)
         self._frame_id[rows] = frame_id
         self._token_id[rows] = torch.arange(self.tokens_per_frame, device=self._token_id.device)
         self._rows += self.tokens_per_frame
         self._pending = frame_id
 
-    def read(self, frames: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+    def read(self, frames: Optional[Tensor] = None, current: Optional[Tuple[Tensor, Tensor]] = None
+             ) -> Tuple[Tensor, Tensor]:
         """Keys and values of every stored row, in the order of ``row_ids``: views of the buffer, followed by the
         dequantised long-patch store if there is one. ``frames`` (frame ids, all stored) reads the rows of those
-        frames only, in the same order; naming every stored frame reads the same views."""
+        frames only, in the same order; naming every stored frame reads the same views.
+
+        ``current`` (training on the stream): the keys and values [B, H, n, D] of the appended, not yet committed
+        frame, read in place of its stored rows (cast to the cache dtype, so the values are the same) with their
+        gradient; the past rows stay detached, and the result is a new tensor, never a view of the buffer.
+        """
         if self._keys is None:
             raise RuntimeError("the cache is empty: append a frame first")
         keys, values = self._keys[:, :, : self._rows], self._values[:, :, : self._rows]
+        if current is not None:
+            keys, values = self._with_current(keys, values, *current)
         if self._quantized_rows:
             quantized_keys, quantized_values = self._quant.dequantized()
             keys, values = torch.cat([keys, quantized_keys], dim=2), torch.cat([values, quantized_values], dim=2)
@@ -522,6 +535,18 @@ class LayerKVCache:
             return keys, values
         rows = rows.nonzero().squeeze(1)
         return keys[:, :, rows], values[:, :, rows]
+
+    def _with_current(self, keys: Tensor, values: Tensor, k: Tensor, v: Tensor) -> Tuple[Tensor, Tensor]:
+        """The buffer rows ``keys``/``values`` with the pending frame's rows (the last n) replaced by ``k``/``v``."""
+        if self._pending is None:
+            raise RuntimeError("no pending frame to read with its gradient: append the current frame first")
+        stored = (*keys.shape[:2], self.tokens_per_frame, keys.shape[3])
+        if k.shape != stored or v.shape != stored:
+            raise ValueError(f"the current frame's keys and values must have the stored shape {stored}, "
+                             f"got {tuple(k.shape)} and {tuple(v.shape)}")
+        past = self._rows - self.tokens_per_frame
+        return (torch.cat([keys[:, :, :past], k.to(self.dtype)], dim=2),
+                torch.cat([values[:, :, :past], v.to(self.dtype)], dim=2))
 
     def row_ids(self) -> Tuple[Tensor, Tensor]:
         """Frame id and token id of every row of ``read()``."""
