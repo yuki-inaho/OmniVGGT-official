@@ -21,6 +21,9 @@ candidate rows. The ``diversity`` selector (InfiniteVGGT-style, query-free) rank
 the long-special frames are then chosen by the ``query`` selector. With ``quant`` the long-patch store keeps
 INT8/INT4 codes (asymmetric, design doc §6): a token is quantised once, when it enters the store, and keeps its
 codes and block scale/offset until it is evicted; the other parts stay in the cache dtype.
+
+A retrieve policy (``retrieve_frames``) is applied by ``StreamingOmega`` (``omnivggt.stream.retrieve``): its caches
+are full caches, and each step reads only the frames the retrieval selected (``LayerKVCache.read(frames)``).
 """
 
 import math
@@ -48,8 +51,8 @@ def _is_int(value) -> bool:
 class CachePolicy:
     """What every cache of a stream keeps.
 
-    * ``recent`` (w >= 1): the w newest frames besides the anchor. ``None`` is the full cache: every frame is kept,
-      and nothing else may be set.
+    * ``recent`` (w >= 1): the w newest frames besides the anchor. ``None`` keeps every frame: the full cache, or
+      with ``retrieve_frames`` a retrieval; nothing else may be set.
     * ``long_special`` (k_U): special tokens of at most k_U other frames.
     * ``long_patch`` (b_P): at most b_P other patch tokens (layers without patches ignore it).
     * ``long_frames`` (k_P): instead of ``long_patch``, every patch token of at most k_P other frames.
@@ -57,6 +60,9 @@ class CachePolicy:
     * ``quant``: ``"int8"`` or ``"int4"`` storage of the long-patch store.
     * ``anchor_every`` (A) and ``max_anchors`` (n_anchor), together or neither: frame 1 + kA becomes an anchor at
       step 1 + kA, and the newest n_anchor of them are kept whole besides frame 1.
+    * ``retrieve_frames`` (N, with ``recent=None``): every frame is stored, and each step reads the anchor, N-1
+      past frames retrieved for it and the current frame (``omnivggt.stream.retrieve``) in every global and
+      register layer; the camera trunk reads its full history, or with ``retrieve_camera`` the same frames.
     """
 
     recent: Optional[int]
@@ -67,15 +73,25 @@ class CachePolicy:
     long_frames: int = 0
     anchor_every: Optional[int] = None
     max_anchors: Optional[int] = None
+    retrieve_frames: Optional[int] = None
+    retrieve_camera: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.retrieve_camera, bool):
+            raise ValueError(f"retrieve_camera must be a bool, got {self.retrieve_camera!r}")
+        if self.retrieve_camera and self.retrieve_frames is None:
+            raise ValueError("retrieve_camera restricts the camera caches to the retrieved frames: set retrieve_frames")
         if self.recent is None:
             others = (self.long_special, self.long_patch, self.long_frames, self.selector, self.quant,
                       self.anchor_every, self.max_anchors)
             if others != (0, 0, 0, None, None, None, None):
                 raise ValueError("the full cache (recent=None) keeps every frame: it takes no long-term store, "
                                  "selector, quantisation or periodic anchor")
+            if self.retrieve_frames is not None and (not _is_int(self.retrieve_frames) or self.retrieve_frames < 1):
+                raise ValueError(f"retrieve_frames must be an int >= 1, got {self.retrieve_frames!r}")
             return
+        if self.retrieve_frames is not None:
+            raise ValueError(f"retrieval reads from the full history: it takes recent=None, got {self.recent!r}")
         if not _is_int(self.recent) or self.recent < 1:
             raise ValueError(f"recent must be an int >= 1 (it includes the current frame), got {self.recent!r}")
         if (self.anchor_every is None) != (self.max_anchors is None):
@@ -120,13 +136,13 @@ class CachePolicy:
 
     @property
     def is_full(self) -> bool:
-        return self.recent is None
+        return self.recent is None and self.retrieve_frames is None
 
     def budget(self, tokens_per_frame: int, special_count: int) -> Optional[int]:
         """Most tokens a cache keeps between steps: (1+n_anchor+w)n + m k_U + b_P (b_P = k_P (n-m) with whole
         frames), or m(1+n_anchor+w+k_U) without patches (register layers: n = m; camera trunk: n = m = 1). None
-        for the full cache."""
-        if self.is_full:
+        when every frame is kept (the full cache, a retrieval)."""
+        if self.recent is None:
             return None
         return ((1 + self.extra_anchors + self.recent) * tokens_per_frame + special_count * self.long_special
                 + self.long_patch_capacity(tokens_per_frame - special_count))
@@ -143,9 +159,9 @@ class CachePolicy:
         return [1, *range(1 + self.anchor_every, t + 1, self.anchor_every)[-self.max_anchors:]]
 
     def protected_frames(self, t: int) -> List[int]:
-        """Frames kept whole after the commit of step ``t`` (ascending): all of them for the full cache, else the
-        anchors and the ``recent`` newest frames."""
-        if self.is_full:
+        """Frames kept whole after the commit of step ``t`` (ascending): all of them when every frame is kept, else
+        the anchors and the ``recent`` newest frames."""
+        if self.recent is None:
             return list(range(1, t + 1))
         return sorted({*self.anchor_frames(t), *range(max(2, t - self.recent + 1), t + 1)})
 
@@ -420,6 +436,9 @@ class LayerKVCache:
             raise ValueError(f"need 1 <= special_count <= tokens_per_frame, got {special_count}, {tokens_per_frame}")
         if initial_frames < 1:
             raise ValueError(f"initial_frames must be positive, got {initial_frames}")
+        if policy.retrieve_frames is not None:
+            raise ValueError("a retrieve policy is applied by StreamingOmega: its layer caches are full caches "
+                             "(CachePolicy.full()) read at the retrieved frames")
         self.policy = policy
         self.tokens_per_frame = tokens_per_frame
         self.special_count = special_count
@@ -481,16 +500,28 @@ class LayerKVCache:
         self._rows += self.tokens_per_frame
         self._pending = frame_id
 
-    def read(self) -> Tuple[Tensor, Tensor]:
+    def read(self, frames: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         """Keys and values of every stored row, in the order of ``row_ids``: views of the buffer, followed by the
-        dequantised long-patch store if there is one."""
+        dequantised long-patch store if there is one. ``frames`` (frame ids, all stored) reads the rows of those
+        frames only, in the same order; naming every stored frame reads the same views."""
         if self._keys is None:
             raise RuntimeError("the cache is empty: append a frame first")
         keys, values = self._keys[:, :, : self._rows], self._values[:, :, : self._rows]
-        if not self._quantized_rows:
+        if self._quantized_rows:
+            quantized_keys, quantized_values = self._quant.dequantized()
+            keys, values = torch.cat([keys, quantized_keys], dim=2), torch.cat([values, quantized_values], dim=2)
+        if frames is None:
             return keys, values
-        quantized_keys, quantized_values = self._quant.dequantized()
-        return torch.cat([keys, quantized_keys], dim=2), torch.cat([values, quantized_values], dim=2)
+        frame_id = self.row_ids()[0]
+        frames = frames.to(frame_id.device)
+        if not bool(torch.isin(frames, frame_id).all()):
+            raise ValueError(f"frames {frames.tolist()} are not all stored (the cache holds frames up to "
+                             f"{int(frame_id.max())})")
+        rows = torch.isin(frame_id, frames)
+        if bool(rows.all()):
+            return keys, values
+        rows = rows.nonzero().squeeze(1)
+        return keys[:, :, rows], values[:, :, rows]
 
     def row_ids(self) -> Tuple[Tensor, Tensor]:
         """Frame id and token id of every row of ``read()``."""
