@@ -10,13 +10,26 @@ from omnivggt.utils.pose_enc import extri_intri_to_pose_encoding
 from torch.utils.checkpoint import checkpoint
 from omnivggt.utils.geometry import closed_form_inverse_se3
 from omnivggt.models.aggregator import Aggregator, slice_expand_and_flatten
+from omnivggt.stream.masks import frame_causal_mask
 
 logger = logging.getLogger(__name__)
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
+DEPTH_NORMS = ("joint", "first_frame")
 
 class ZeroAggregator(Aggregator):
+    """OmniVGGT aggregator: alternating attention with the GeoAdapter camera/depth injection.
+
+    Frame-causal options (independent of each other):
+
+    * ``causal``: in the inter-frame (global) blocks a token of frame a attends only to frames b <= a
+      (all tokens of its own frame included). Camera input is rejected, since its normalisation uses every
+      selected camera; with ``depth_norm="joint"`` the auxiliary depth still is normalised over all views.
+    * ``depth_norm``: the auxiliary depth is divided by the mean valid depth of all selected views
+      (``"joint"``) or of frame 0 only (``"first_frame"``), which must then be the first depth view.
+    """
+
     def __init__(self, img_size=518, 
                  patch_size=14, 
                  embed_dim=1024, 
@@ -38,7 +51,11 @@ class ZeroAggregator(Aggregator):
                  rope_freq=100, 
                  init_values=0.01,
                  enable_checkpoint=True,
-                 depth_all_views=False):
+                 depth_all_views=False,
+                 causal=False,
+                 depth_norm="joint"):
+        if depth_norm not in DEPTH_NORMS:
+            raise ValueError(f"depth_norm must be one of {DEPTH_NORMS}, got {depth_norm!r}")
         super().__init__(img_size, 
                          patch_size, 
                          embed_dim, 
@@ -61,6 +78,9 @@ class ZeroAggregator(Aggregator):
         self.cam_drop_prob = cam_drop_prob
         self.depth_drop_prob = depth_drop_prob
         self.depth_all_views = depth_all_views  # training: auxiliary depth on every view (RGB-D-only use)
+        self.causal = causal
+        self.depth_norm = depth_norm
+        self._stream = None  # streaming context (omnivggt.stream); None runs whole batches
         self.patch_start_idx = 1 + num_register_tokens
         self.depth_placeholder = nn.Parameter(torch.zeros(1, 1, embed_dim))
         
@@ -119,16 +139,22 @@ class ZeroAggregator(Aggregator):
         """
         depth: [B, V, H, W, 1]
         mask:  [B, V, H, W]
+
+        Divides the views of each sample by the mean valid depth of all of them (``depth_norm="joint"``) or of
+        the first one (``"first_frame"``; ``_check_inputs`` makes it frame 0), and zeroes the invalid pixels.
         """
         assert depth.shape[:4] == mask.shape, "mask and depth must have the same first four dimensions"
 
         B, V, H, W, _ = depth.shape
         depth_squeezed = depth.squeeze(-1)
         norm = torch.zeros_like(depth_squeezed)
+        reference_views = V if self.depth_norm == "joint" else 1
 
         for b in range(B):
-            valid = depth_squeezed[b][mask[b] > 0]
+            valid = depth_squeezed[b, :reference_views][mask[b, :reference_views] > 0]
             if valid.numel() == 0:
+                if self.depth_norm == "first_frame":
+                    raise ValueError("depth_norm='first_frame': frame 0 has no valid auxiliary depth pixel")
                 continue
 
             mean = valid.mean()
@@ -173,6 +199,26 @@ class ZeroAggregator(Aggregator):
             return list(range(S))
         return self.select_depth_gt(S, self.depth_drop_prob, rng=rng)
     
+    def _check_training_options(self):
+        """Training draws the auxiliary inputs at random: reject options whose draws the mode cannot use."""
+        if self.causal and self.cam_drop_prob < 1:
+            raise ValueError(f"causal=True takes no camera input: training needs cam_drop_prob=1, "
+                             f"got {self.cam_drop_prob}")
+        if self.depth_norm == "first_frame" and not self.depth_all_views:
+            raise ValueError("depth_norm='first_frame' needs the depth of frame 0 in every training forward: "
+                             "set depth_all_views=True (a random depth subset may leave frame 0 out)")
+
+    def _check_inputs(self, depth_gt_index, camera_gt_index):
+        """Reject auxiliary inputs the configured mode cannot use (there is no fallback)."""
+        if self._stream is not None:
+            raise NotImplementedError("a streaming context is set, but this aggregator only runs whole batches")
+        if self.causal and len(camera_gt_index) != 0:
+            raise ValueError("causal=True takes no camera input (its normalisation uses every selected camera), "
+                             f"got camera_gt_index={list(camera_gt_index)}")
+        if self.depth_norm == "first_frame" and len(depth_gt_index) != 0 and depth_gt_index[0] != 0:
+            raise ValueError("depth_norm='first_frame' needs the depth of frame 0 as the first depth view, "
+                             f"got depth_gt_index={list(depth_gt_index)}")
+
     def forward(self, images: torch.Tensor, 
                 extrinsics: torch.Tensor, 
                 intrinsics: torch.Tensor,
@@ -183,6 +229,7 @@ class ZeroAggregator(Aggregator):
         
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
+        self._check_training_options()
 
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
@@ -203,6 +250,7 @@ class ZeroAggregator(Aggregator):
         # which views get the auxiliary camera / depth (modality_rng: keyed generator from the training loop)
         camera_gt_index = self.select_camera_gt(S, self.cam_drop_prob, rng=modality_rng)
         depth_gt_index  = self.training_depth_gt_index(S, rng=modality_rng)
+        self._check_inputs(depth_gt_index, camera_gt_index)
         
         if len(camera_gt_index) != 0:
             camera_gt_length = len(camera_gt_index)
@@ -275,6 +323,7 @@ class ZeroAggregator(Aggregator):
         # update P because we added special tokens
         P_old = P
         _, P, C = tokens.shape
+        attn_mask = frame_causal_mask(S, P, tokens.device) if self.causal else None  # of the inter-frame blocks
 
         frame_idx = 0
         global_idx = 0
@@ -289,7 +338,7 @@ class ZeroAggregator(Aggregator):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -313,6 +362,7 @@ class ZeroAggregator(Aggregator):
         
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
+        self._check_inputs(depth_gt_index, camera_gt_index)
 
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
@@ -401,6 +451,7 @@ class ZeroAggregator(Aggregator):
         # update P because we added special tokens
         P_old = P
         _, P, C = tokens.shape
+        attn_mask = frame_causal_mask(S, P, tokens.device) if self.causal else None  # of the inter-frame blocks
 
         frame_idx = 0
         global_idx = 0
@@ -415,7 +466,7 @@ class ZeroAggregator(Aggregator):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")

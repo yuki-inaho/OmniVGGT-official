@@ -310,9 +310,10 @@ class Aggregator(nn.Module):
         return tokens, frame_idx, intermediates
 
     def _process_global_attention(self, tokens, B, S, P, C, global_idx,
-                                  pos=None, pose_encoding=None, depth_encoding=None):
+                                  pos=None, pose_encoding=None, depth_encoding=None, attn_mask=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
+        ``attn_mask`` ([S*P, S*P], True = may attend), if given, restricts the attention (e.g. frame-causal).
         """
         if tokens.shape != (B, S * P, C):
             tokens = tokens.view(B, S, P, C).view(B, S * P, C)
@@ -324,22 +325,18 @@ class Aggregator(nn.Module):
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            blk = self.global_blocks[global_idx]   
-            if self.use_checkpoint and self.training:
-                tokens = checkpoint(
-                    lambda inp, p: blk(inp, pos=p, ),        
-                    tokens,
-                    pos,
-                    use_reentrant=False
-                )
-            else:
-                tokens = blk(tokens, pos=pos, )
-
+            tokens = self._run_global_block(self.global_blocks[global_idx], tokens, pos, attn_mask)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
-    
+
+    def _run_global_block(self, block, tokens, pos=None, attn_mask=None):
+        """Run one global (inter-frame) block, under gradient checkpointing when training."""
+        if self.use_checkpoint and self.training:
+            return checkpoint(block, tokens, pos, attn_mask, use_reentrant=False)
+        return block(tokens, pos=pos, attn_mask=attn_mask)
+
 def slice_expand_and_flatten(token_tensor, B, S):
     """
     Processes specialized tokens with shape (1, 2, X, C) for multi-frame processing:
