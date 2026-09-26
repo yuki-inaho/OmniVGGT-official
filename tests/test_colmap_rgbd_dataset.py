@@ -129,5 +129,5 @@ def test_sequential_view_selection_is_deterministic(tmp_path):
     dataset = _dataset(tmp_path, view_selection="sequential", sequential_stride=2)
     sample = dataset[(3, 0, 4)]
     assert sample["instance"] == [f"frame_{i:06d}.png" for i in (3, 5, 7, 9)]
-    with pytest.raises(IndexError):
-        dataset[(20, 0, 4)]  # would run past the end of the train split
+    late = dataset[(20, 0, 4)]  # 20..26 would run past the end of the train split (23): moved back to end there
+    assert late["instance"] == [f"frame_{i:06d}.png" for i in (17, 19, 21, 23)]
