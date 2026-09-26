@@ -10,7 +10,9 @@
 import logging
 import os
 import warnings
+from typing import Optional, Tuple
 
+import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -47,8 +49,9 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
-        B, N, C = x.shape
+    def qkv_heads(self, x: Tensor, pos=None) -> Tuple[Tensor, Tensor, Tensor]:
+        """Per-head queries, keys and values, each [B, H, N, D]: qkv projection, q/k norm, then RoPE (if any)."""
+        B, N, _ = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
@@ -56,25 +59,39 @@ class Attention(nn.Module):
         if self.rope is not None:
             q = self.rope(q, pos)
             k = self.rope(k, pos)
+        return q, k, v
 
+    def attend(self, q: Tensor, k: Tensor, v: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
+        """Attention of the queries over the given keys and values, then the output projection: [B, N_q, C].
+
+        ``attn_mask`` has the meaning of ``F.scaled_dot_product_attention`` (bool: True = may attend; float: added
+        to the scores); it must broadcast to [B, H, N_q, N_k].
+        """
+        B, H, N, D = q.shape
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
+                attn_mask=attn_mask,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
             )
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
+            if attn_mask is not None:
+                attn = attn.masked_fill(~attn_mask, float("-inf")) if attn_mask.dtype == torch.bool else attn + attn_mask
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
 
-        x = x.transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).reshape(B, N, H * D)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+    def forward(self, x: Tensor, pos=None, attn_mask: Optional[Tensor] = None) -> Tensor:
+        return self.attend(*self.qkv_heads(x, pos=pos), attn_mask=attn_mask)
 
 
 class MemEffAttention(Attention):

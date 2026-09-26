@@ -9,7 +9,7 @@
 
 import logging
 import os
-from typing import Callable, List, Any, Tuple, Dict
+from typing import Callable, List, Any, Optional, Tuple, Dict
 import warnings
 
 import torch
@@ -78,15 +78,24 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, attn_mask: Optional[Tensor] = None) -> Tensor:
+        """``attn_mask`` (see ``Attention.attend``) is passed to the attention only when given: the image
+        encoder's ``MemEffAttention`` does not take it."""
+        attn_kwargs = {} if attn_mask is None else {"attn_mask": attn_mask}
+
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos))
+            return self.ls1(self.attn(self.norm1(x), pos=pos, **attn_kwargs))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))
 
         if self.training and self.sample_drop_ratio > 0.1:
             # the overhead is compensated only for a drop path rate larger than 0.1
+            if attn_mask is not None and attn_mask.dim() > 2:
+                raise NotImplementedError(
+                    "stochastic depth runs the residual on a subset of the samples; only an attn_mask shared by "
+                    f"all samples ([N, N]) can follow it, got shape {tuple(attn_mask.shape)}"
+                )
             x = drop_add_residual_stochastic_depth(
                 x,
                 pos=pos,
