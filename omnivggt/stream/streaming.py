@@ -107,8 +107,12 @@ class StreamingOmega:
         self.camera_dtype = head.empty_pose_tokens.dtype
         self.reset()
 
-    def reset(self) -> None:
-        """Forget the stream: the next step is t=1."""
+    def reset(self, max_frames: Optional[int] = None) -> None:
+        """Forget the stream: the next step is t=1. ``max_frames`` (optional) is the stream length: full caches
+        are then allocated once for it (no reallocation while streaming) and a longer stream raises."""
+        if max_frames is not None and max_frames < 1:
+            raise ValueError(f"max_frames must be positive, got {max_frames}")
+        self.max_frames = max_frames
         self.t = 0
         self.depth_scale = None
         self.image_hw = None
@@ -125,6 +129,8 @@ class StreamingOmega:
             raise RuntimeError("a previous step failed and left the caches inconsistent: call reset()")
         batch, image_hw, depth_scale = self._check_step_inputs(image, depth, mask)
         t = self.t + 1
+        if self.max_frames is not None and t > self.max_frames:
+            raise ValueError(f"the stream was reset with max_frames={self.max_frames}: call reset() for a new stream")
         has_depth = depth is not None
         if has_depth and t == 1:
             depth_scale = first_frame_depth_scale(depth, mask)
@@ -174,8 +180,10 @@ class StreamingOmega:
         tokens = special + grid_hw[0] * grid_hw[1]
         register_layers = aggregator.register_attention_layers
 
+        sized = {} if self.max_frames is None else {"initial_frames": self.max_frames}
+
         def cache(tokens_per_frame, special_count, dtype, layer_id):
-            return LayerKVCache(self.policy, tokens_per_frame, special_count, dtype, layer_id)
+            return LayerKVCache(self.policy, tokens_per_frame, special_count, dtype, layer_id, **sized)
 
         return {
             "global": {i: cache(tokens, special, self.dtype, i)

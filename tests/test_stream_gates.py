@@ -83,3 +83,38 @@ def test_eval_stream_runs_the_real_streamer_and_matches_its_batch_mode():
     # the same causal model: streaming reproduces one batch forward (bidir_f0 only names the model options);
     # eval_stream keeps predictions in fp32, so the tolerance is fp32 rounding
     torch.testing.assert_close(stream["pose_enc"], batch["pose_enc"], atol=1e-6, rtol=0)
+
+
+def test_full_cache_is_allocated_once_for_a_known_stream_length():
+    from omnivggt.stream.streaming import StreamingOmega, all_caches
+
+    model, inputs = _causal(), _inputs()
+    streamer = StreamingOmega(model, CachePolicy.full())
+    streamer.reset(max_frames=4)
+    capacities = []
+    for t in range(4):
+        streamer.step(inputs["images"][:, t], inputs["depth"][:, t], inputs["mask"][:, t])
+        capacities.append([cache.capacity for cache in all_caches(streamer.caches)])
+    assert capacities[0] == capacities[-1]  # no reallocation while streaming
+    assert all(cache.capacity == 4 * cache.tokens_per_frame for cache in all_caches(streamer.caches))
+    with pytest.raises(ValueError, match="max_frames"):
+        streamer.step(inputs["images"][:, 0], inputs["depth"][:, 0], inputs["mask"][:, 0])
+
+
+def test_eval_stream_allocates_each_window_once():
+    import eval_stream
+
+    calls = []
+
+    class Recorder:
+        def reset(self, max_frames=None):
+            calls.append(max_frames)
+
+        def step(self, image, depth, mask):
+            return {"pose_enc": torch.zeros(1, 1, 9), "depth": torch.ones(1, 1, 28, 42, 1)}
+
+        def kv_bytes(self):
+            return 0
+
+    eval_stream.predict_stream(Recorder(), _inputs(), True, eval_stream.Meter("cpu"))
+    assert calls == [4]

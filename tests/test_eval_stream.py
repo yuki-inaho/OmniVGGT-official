@@ -395,7 +395,7 @@ class FakeStreaming:
         self.model, self.policy, self.dtype = model, policy, dtype
         self.t, self.resets, self.inputs = 0, 0, []
 
-    def reset(self):
+    def reset(self, max_frames=None):
         self.t, self.resets = 0, self.resets + 1
 
     def step(self, image, depth, mask):

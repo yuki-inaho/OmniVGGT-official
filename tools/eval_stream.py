@@ -299,8 +299,9 @@ def _one_frame(output: dict) -> dict:
 
 
 def predict_stream(streamer, inputs: dict, use_depth: bool, meter: Meter) -> dict:
-    """``stream``: frame t from ``streamer.step`` after frames 1..t-1; analytic KV bytes after each step."""
-    streamer.reset()
+    """``stream``: frame t from ``streamer.step`` after frames 1..t-1; analytic KV bytes after each step. The
+    stream length is known, so full caches are allocated once for the window."""
+    streamer.reset(max_frames=inputs["images"].shape[1])
     meter.start()
     poses, depths, step_ms, kv_bytes = [], [], [], []
     for t in range(inputs["images"].shape[1]):
