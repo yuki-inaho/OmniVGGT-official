@@ -11,10 +11,13 @@ A bounded cache is partitioned (design doc §4; no row is in two parts) into
 * anchor: every token of frame 1, always kept;
 * recent: every token of the ``recent`` newest frames (the current one included, frame 1 excluded);
 * long-special: the special tokens of at most ``long_special`` other frames, selected per frame;
-* long-patch: at most ``long_patch`` other patch tokens, selected per token.
+* long-patch: at most ``long_patch`` other patch tokens, selected per token, or (``long_frames``) every patch
+  token of at most ``long_frames`` other frames, selected per frame (IncVGGT-style whole frames).
 
 The long-term stores are selected at the commit, from every candidate of the written cache, by the policy's
-selector; ties go to the newer frame, then to the smaller token id. With ``quant`` the long-patch store keeps
+selector; ties go to the newer frame, then to the smaller token id. A frame is ranked by the mean score of its
+candidate rows. The ``diversity`` selector (InfiniteVGGT-style, query-free) ranks the long-patch candidates only;
+the long-special frames are then chosen by the ``query`` selector. With ``quant`` the long-patch store keeps
 INT8/INT4 codes (asymmetric, design doc §6): a token is quantised once, when it enters the store, and keeps its
 codes and block scale/offset until it is evicted; the other parts stay in the cache dtype.
 """
@@ -25,9 +28,10 @@ from typing import Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
-SELECTOR_NAMES = ("query", "xstream", "recency", "random")
+SELECTOR_NAMES = ("query", "xstream", "recency", "random", "diversity")
 QUANT_BITS = {"int8": 8, "int4": 4}
 QUANT_NAMES = tuple(QUANT_BITS)
 QUANT_BLOCK = 64  # K: tokens of one channel per scale/offset; V: channels of one token
@@ -47,6 +51,7 @@ class CachePolicy:
       and nothing else may be set.
     * ``long_special`` (k_U): special tokens of at most k_U other frames.
     * ``long_patch`` (b_P): at most b_P other patch tokens (layers without patches ignore it).
+    * ``long_frames`` (k_P): instead of ``long_patch``, every patch token of at most k_P other frames.
     * ``selector``: one of ``SELECTOR_NAMES``; required exactly when there is a long-term store.
     * ``quant``: ``"int8"`` or ``"int4"`` storage of the long-patch store.
     """
@@ -56,28 +61,33 @@ class CachePolicy:
     long_patch: int = 0
     selector: Optional[str] = None
     quant: Optional[str] = None
+    long_frames: int = 0
 
     def __post_init__(self):
         if self.recent is None:
-            if (self.long_special, self.long_patch, self.selector, self.quant) != (0, 0, None, None):
+            long_term = (self.long_special, self.long_patch, self.long_frames, self.selector, self.quant)
+            if long_term != (0, 0, 0, None, None):
                 raise ValueError("the full cache (recent=None) keeps every frame: it takes no long-term store, "
                                  "selector or quantisation")
             return
         if not _is_int(self.recent) or self.recent < 1:
             raise ValueError(f"recent must be an int >= 1 (it includes the current frame), got {self.recent!r}")
-        for name in ("long_special", "long_patch"):
+        for name in ("long_special", "long_patch", "long_frames"):
             value = getattr(self, name)
             if not _is_int(value) or value < 0:
                 raise ValueError(f"{name} must be an int >= 0, got {value!r}")
-        has_long_term = self.long_special > 0 or self.long_patch > 0
+        if self.long_patch > 0 and self.long_frames > 0:
+            raise ValueError("the long-patch store keeps tokens (long_patch) or whole frames (long_frames), not both")
+        has_long_patch = self.long_patch > 0 or self.long_frames > 0
+        has_long_term = self.long_special > 0 or has_long_patch
         if has_long_term and self.selector not in SELECTOR_NAMES:
             raise ValueError(f"a long-term store needs a selector from {SELECTOR_NAMES}, got {self.selector!r}")
         if not has_long_term and self.selector is not None:
             raise ValueError(f"selector {self.selector!r} given, but there is no long-term store to select")
         if self.quant is not None and self.quant not in QUANT_NAMES:
             raise ValueError(f"quant must be None or one of {QUANT_NAMES}, got {self.quant!r}")
-        if self.quant is not None and self.long_patch == 0:
-            raise ValueError("quant applies to the long-patch store only, but long_patch=0")
+        if self.quant is not None and not has_long_patch:
+            raise ValueError("quant applies to the long-patch store only, but long_patch=0 and long_frames=0")
 
     @classmethod
     def full(cls) -> "CachePolicy":
@@ -99,12 +109,18 @@ class CachePolicy:
         return self.recent is None
 
     def budget(self, tokens_per_frame: int, special_count: int) -> Optional[int]:
-        """Most tokens a cache keeps between steps: (1+w)n + m k_U + b_P, or m(1+w+k_U) without patches
-        (register layers: n = m; camera trunk: n = m = 1). None for the full cache."""
+        """Most tokens a cache keeps between steps: (1+w)n + m k_U + b_P (b_P = k_P (n-m) with whole frames), or
+        m(1+w+k_U) without patches (register layers: n = m; camera trunk: n = m = 1). None for the full cache."""
         if self.is_full:
             return None
-        patches = self.long_patch if tokens_per_frame > special_count else 0
-        return (1 + self.recent) * tokens_per_frame + special_count * self.long_special + patches
+        return ((1 + self.recent) * tokens_per_frame + special_count * self.long_special
+                + self.long_patch_capacity(tokens_per_frame - special_count))
+
+    def long_patch_capacity(self, patches: int) -> int:
+        """Most long-patch tokens of a layer with ``patches`` patch tokens per frame: b_P, or k_P whole frames."""
+        if patches == 0:
+            return 0
+        return self.long_patch + self.long_frames * patches
 
 
 @dataclass(frozen=True)
@@ -119,6 +135,7 @@ class Candidates:
     grid_hw: Optional[Tuple[int, int]]  # patch grid (rows, columns) of a frame; None without patches
     layer_id: int
     t: int
+    pool: Optional[Tensor] = None  # [N] bool, the long-patch candidates (the diversity selector's pool)
 
 
 def query_groups(special_count: int, grid_hw: Optional[Tuple[int, int]]) -> Tensor:
@@ -191,7 +208,20 @@ def select_random(candidates: Candidates) -> Tensor:
     return torch.from_numpy(generator.random(candidates.frame_id.numel())).to(candidates.frame_id.device)
 
 
-SELECTORS = {"query": select_query, "xstream": select_xstream, "recency": select_recency, "random": select_random}
+def select_diversity(candidates: Candidates) -> Tensor:
+    """InfiniteVGGT's query-free diversity of every row: s_j = -(1/H) sum_h cos(k_{h,j}, mu_h), mu_h the mean of
+    the unit keys khat = k / |k| of the pool (the long-patch candidates). One score per row, so every head keeps
+    the same rows; rows far from the pool's mean direction are kept first."""
+    pool = candidates.pool
+    if pool is None or not bool(pool.any()):
+        raise ValueError("the diversity selector scores against the long-patch pool: give a non-empty pool")
+    unit = F.normalize(candidates.keys.to(_score_dtype(candidates)), dim=-1)  # [1, H, N, D]
+    direction = F.normalize(unit[:, :, pool].mean(dim=2, keepdim=True), dim=-1)  # [1, H, 1, D]
+    return -(unit * direction).sum(dim=-1).mean(dim=1)[0]
+
+
+SELECTORS = {"query": select_query, "xstream": select_xstream, "recency": select_recency, "random": select_random,
+             "diversity": select_diversity}
 
 
 def _ranked(scores: Tensor, frame_id: Tensor, token_id: Tensor) -> Tensor:
@@ -372,7 +402,8 @@ class LayerKVCache:
         if policy.is_full:
             self._initial_rows = initial_frames * tokens_per_frame
         else:
-            self._initial_rows = self.budget + tokens_per_frame - (policy.long_patch if self._quant else 0)
+            quantized = policy.long_patch_capacity(tokens_per_frame - special_count) if self._quant else 0
+            self._initial_rows = self.budget + tokens_per_frame - quantized
         self._pending = None  # frame id appended but not committed yet
         self._keys = self._values = None  # [B, H, capacity, D], allocated on the first append
         self._frame_id = self._token_id = None  # [capacity] int64, row metadata
@@ -478,8 +509,12 @@ class LayerKVCache:
             "protected_complete": unique and int(protected.sum()) == n * len(protected_frames),
             "long_special": long_special_frames.numel() <= self.policy.long_special
             and bool((special_counts == m).all()),
-            "long_patch": long_patch_tokens <= (self.policy.long_patch if n > m else 0),
+            "long_patch": long_patch_tokens <= self.policy.long_patch_capacity(n - m),
         }
+        if self.policy.long_frames:  # whole frames: every patch of at most k_P frames
+            long_patch_frames, patch_counts = torch.unique(frame_id[long_patch], return_counts=True)
+            checks["long_frames"] = (long_patch_frames.numel() <= self.policy.long_frames
+                                     and bool((patch_counts == n - m).all()))
         if self._quant is not None:  # the long-patch rows are exactly the quantised ones, and their blocks live
             quantized = torch.zeros_like(long_patch)
             quantized[self._rows:] = True  # row_ids lists the quantised store after the buffer
@@ -505,20 +540,33 @@ class LayerKVCache:
         special = token_id < self.special_count
         long_special, long_patch = ~protected & special, ~protected & ~special
         select_special = torch.unique(frame_id[long_special]).numel() > policy.long_special
-        select_patch = int(long_patch.sum()) > policy.long_patch
+        if policy.long_frames:
+            select_patch = torch.unique(frame_id[long_patch]).numel() > policy.long_frames
+        else:
+            select_patch = int(long_patch.sum()) > policy.long_patch
         keep = protected.clone()
         if not (select_special or select_patch):  # fewer candidates than the budget: keep them all
             return keep | long_special | long_patch, long_patch
-        scores = self._scores(q, t, grid_hw)
-        if select_special:
-            kept_frames = top_frames(scores, frame_id, long_special, policy.long_special)
+        scores = {}  # per selector, computed at most once per commit
+
+        def scored(selector: str) -> Tensor:
+            if selector not in scores:
+                scores[selector] = self._scores(selector, q, t, grid_hw, long_patch)
+            return scores[selector]
+
+        if select_special:  # diversity ranks the patches only: the special tokens keep the query selector
+            special_selector = "query" if policy.selector == "diversity" else policy.selector
+            kept_frames = top_frames(scored(special_selector), frame_id, long_special, policy.long_special)
             keep |= long_special & torch.isin(frame_id, kept_frames)
         else:
             keep |= long_special
-        if select_patch:
-            keep[top_rows(scores, frame_id, token_id, long_patch, policy.long_patch)] = True
-        else:
+        if not select_patch:
             keep |= long_patch
+        elif policy.long_frames:
+            kept_frames = top_frames(scored(policy.selector), frame_id, long_patch, policy.long_frames)
+            keep |= long_patch & torch.isin(frame_id, kept_frames)
+        else:
+            keep[top_rows(scored(policy.selector), frame_id, token_id, long_patch, policy.long_patch)] = True
         return keep, long_patch
 
     def _keep(self, keep: Tensor, long_patch: Tensor) -> None:
@@ -537,12 +585,13 @@ class LayerKVCache:
         keep_buffer[entering] = False
         self._compact(keep_buffer)
 
-    def _scores(self, q: Tensor, t: int, grid_hw: Optional[Tuple[int, int]]) -> Tensor:
+    def _scores(self, selector: str, q: Tensor, t: int, grid_hw: Optional[Tuple[int, int]], pool: Tensor) -> Tensor:
         frame_id, token_id = self.row_ids()
-        candidates = Candidates(q, self.read()[0], frame_id, token_id, self.special_count, grid_hw, self.layer_id, t)
-        scores = SELECTORS[self.policy.selector](candidates)
+        candidates = Candidates(q, self.read()[0], frame_id, token_id, self.special_count, grid_hw, self.layer_id, t,
+                                pool)
+        scores = SELECTORS[selector](candidates)
         if not torch.isfinite(scores).all():
-            raise ValueError(f"selector {self.policy.selector!r} gave non-finite scores at layer {self.layer_id}")
+            raise ValueError(f"selector {selector!r} gave non-finite scores at layer {self.layer_id}")
         return scores
 
     def _compact(self, keep: Tensor) -> None:
