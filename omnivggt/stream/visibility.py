@@ -65,8 +65,8 @@ def visible_frames_block(block, x: Tensor, visibility: Tensor, pos: Optional[Ten
     heads, dim = k.shape[1], k.shape[-1]
     k, v = (t.view(batch, heads, num_frames, per_frame, dim) for t in (k, v))
     outputs = []
-    for frame, row in enumerate(visibility.to(x.device)):
-        visible = row.nonzero().flatten()
+    for frame, row in enumerate(visibility.cpu()):  # the indices on the host: no device sync per query frame
+        visible = row.nonzero().flatten().to(x.device)
         keys, values = (t[:, :, visible].flatten(2, 3) for t in (k, v))
         outputs.append(attn.attend(q[:, :, frame * per_frame : (frame + 1) * per_frame], keys, values))
     x = x + block.ls1(torch.cat(outputs, dim=1))
