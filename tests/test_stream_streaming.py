@@ -244,11 +244,14 @@ def test_stream_outputs_ignore_later_frames(condition):
     assert not torch.equal(runs[0][-1]["pose_enc"], changed_last["pose_enc"])
 
 
-@pytest.mark.parametrize("selector", ["query", "xstream", "recency", "random"])
-def test_bounded_cache_larger_than_the_history_equals_the_full_cache(selector):
+@pytest.mark.parametrize("selector, store", [
+    ("query", "long_patch"), ("xstream", "long_patch"), ("recency", "long_patch"), ("random", "long_patch"),
+    ("diversity", "long_patch"), ("query", "long_frames"), ("diversity", "long_frames"),
+])
+def test_bounded_cache_larger_than_the_history_equals_the_full_cache(selector, store):
     model, sequence = _causal_model(), _sequence()
     batch = _batch(model, sequence, "depth")
-    roomy = CachePolicy(recent=2, long_special=100, long_patch=10_000, selector=selector)
+    roomy = CachePolicy(recent=2, long_special=100, selector=selector, **{store: 10_000})
     stream = StreamingOmega(model, roomy)
     streamed = _stream(stream, sequence, "depth")
     for key in OUTPUTS:
@@ -274,6 +277,28 @@ def test_small_bounded_caches_stay_within_budget_over_20_frames(selector, quant)
         for cache in (cache for row in stream.caches["camera"] for cache in row):
             assert cache.invariants()["ok"] and cache.size <= cache.budget == budgets["camera"]
     assert stream.kv_bytes() == sum(cache.nbytes() for cache in all_caches(stream.caches))
+
+
+@pytest.mark.parametrize("policy", [
+    dict(recent=1, long_special=1, long_patch=4, selector="diversity", quant="int8"),
+    dict(recent=1, long_special=1, long_frames=1, selector="query", quant="int8"),
+    dict(recent=1, long_special=2, long_frames=2, selector="diversity", quant="int4"),
+    dict(recent=1, long_special=1, long_frames=1, selector="diversity", quant="int8", anchor_every=4, max_anchors=2),
+    dict(recent=3),  # a sliding window (the W_N control): no long-term store
+])
+def test_phase5_bounded_caches_stay_within_budget_over_20_frames(policy):
+    policy = CachePolicy(**policy)
+    model, sequence = _causal_model(), _sequence(frames=20)
+    stream = StreamingOmega(model, policy)
+    for frame in range(20):
+        out = stream.step(*_frame_inputs(sequence, frame, "depth"))
+        assert all(torch.isfinite(out[key]).all() for key in OUTPUTS)
+        for cache in all_caches(stream.caches):
+            invariants = cache.invariants()
+            assert invariants["ok"] and cache.size <= cache.budget, (cache.layer_id, invariants)
+    tokens, special = model.aggregator.patch_start_idx + 2 * 3, model.aggregator.patch_start_idx
+    assert stream.caches["global"][0].budget == policy.budget(tokens, special)
+    assert stream.caches["global"][0].size == policy.budget(tokens, special)  # every store is full after 20 frames
 
 
 def test_backbone_caches_store_the_given_dtype_and_camera_caches_the_head_dtype():

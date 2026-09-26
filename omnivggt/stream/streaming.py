@@ -9,49 +9,79 @@ on the aggregator and the camera head. With the context set,
   camera-trunk block, with one cache per (refinement iteration, block).
 
 With ``CachePolicy.full()`` step t equals frame t of the batch frame-causal inference (``causal=True``,
-``depth_norm="first_frame"``); a bounded policy keeps, per cache, what ``LayerKVCache`` describes.
+``depth_norm="first_frame"``); a bounded policy keeps, per cache, what ``LayerKVCache`` describes. A retrieve
+policy stores the full history and reads, per step, the frames a ``FrameRetriever`` selects in the first global
+layer (``omnivggt.stream.retrieve``).
+
+``StreamingOmega(train=True)`` trains on the stream (XStream-style, one-frame BPTT): a step runs with gradients
+(unless the caller disables them) and the model may be in training mode; every attention reads the stored past
+detached and the current frame's keys and values with their gradient, so a loss of frame t backpropagates through
+frame t only. Its forward values equal those of ``train=False`` (without dropout or stochastic depth).
 """
 
-from typing import Dict, Optional, Tuple
+import contextlib
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from omnivggt.heads.camera_head import NUM_ITERATIONS
 from omnivggt.stream.kv_cache import CachePolicy, LayerKVCache
+from omnivggt.stream.retrieve import FrameRetriever
 
 STEP_OUTPUTS = ("pose_enc", "depth", "depth_conf", "world_points")
 
 
 def stream_block(block, x: Tensor, cache: LayerKVCache, t: int, grid_hw: Optional[Tuple[int, int]] = None,
-                 pos: Optional[Tensor] = None) -> Tensor:
+                 pos: Optional[Tensor] = None, read_frames: Optional[Callable[[Tensor, Tensor], Tensor]] = None,
+                 train: bool = False) -> Tensor:
     """One inter-frame ``Block`` on the tokens of frame ``t`` ([B, n, C]), attending to the cached past and the frame.
 
-    The residual structure of ``Block.forward`` in eval mode: the current keys and values are appended to
-    ``cache`` before the attention (a frame sees all of its own tokens), and the cache commits (selects what it
+    The residual structure of ``Block.forward`` without stochastic depth: the current keys and values are appended
+    to ``cache`` before the attention (a frame sees all of its own tokens), and the cache commits (selects what it
     keeps for the next step) after the block. ``grid_hw`` is the patch grid of the frame and ``pos`` the token
-    positions (for a block with RoPE).
+    positions (for a block with RoPE). ``read_frames(q, k)`` (retrieval) gives, from the current queries and keys,
+    the frame ids the attention reads (the current frame included); by default it reads every stored row.
+
+    ``train`` (training on the stream): the block may be in training mode, and the attention reads the stored past
+    detached and the current keys and values with their gradient. The cache stores detached keys and values and
+    selects from detached queries either way.
     """
-    if block.training:
-        raise NotImplementedError("stream_block runs blocks in eval mode only (no dropout or stochastic depth)")
+    if block.training and not train:
+        raise NotImplementedError("stream_block runs blocks in eval mode only (no dropout or stochastic depth); "
+                                  "training on the stream takes train=True")
+    if block.training and block.sample_drop_ratio > 0:
+        raise NotImplementedError("stream_block does not run stochastic depth: build the blocks with drop_path=0")
     attn = block.attn
     q, k, v = attn.qkv_heads(block.norm1(x), pos=pos)
     cache.append(k, v, t)
-    keys, values = cache.read()
+    frames = None if read_frames is None else read_frames(q.detach(), k.detach())
+    keys, values = cache.read(frames, current=(k, v)) if train else cache.read(frames)
     x = x + block.ls1(attn.attend(q, keys.to(q.dtype), values.to(q.dtype)))
     x = x + block.ls2(block.mlp(block.norm2(x)))
-    cache.commit(q, t, grid_hw)
+    cache.commit(q.detach(), t, grid_hw)
     return x
 
 
 class _StreamContext:
-    """What the aggregator and the camera head read while ``StreamingOmega`` runs stream time ``t``."""
+    """What the aggregator and the camera head read while ``StreamingOmega`` runs stream time ``t``.
 
-    def __init__(self, t: int, depth_scale: Optional[Tensor], grid_hw: Tuple[int, int], caches: Dict):
+    With a ``retriever`` the first global layer selects the frames of this step, and every other global and
+    register layer (and, with ``retrieve_camera``, every camera-trunk block) reads the same frames. ``train`` runs
+    every block as ``stream_block(train=True)``.
+    """
+
+    def __init__(self, t: int, depth_scale: Optional[Tensor], grid_hw: Tuple[int, int], caches: Dict,
+                 retriever: Optional[FrameRetriever] = None, retrieve_camera: bool = False, train: bool = False):
         self.t = t
         self.depth_scale = depth_scale  # gamma per sample, [B]; None when frame 1 had no depth
         self.grid_hw = grid_hw
         self.caches = caches
+        self.retriever = retriever
+        self.retrieve_camera = retrieve_camera
+        self.train = train
+        self.select_layer = None if retriever is None else min(caches["global"])
+        self.frames = None  # the frames read at this step, once the first global layer selected them
 
     @property
     def is_first(self) -> bool:
@@ -63,13 +93,31 @@ class _StreamContext:
 
     def run_global(self, layer_idx: int, block, x: Tensor, pos: Optional[Tensor] = None) -> Tensor:
         """Global block ``layer_idx`` on all tokens of the frame, or register block on its special tokens."""
+        if self.retriever is None:
+            read_frames = None
+        else:
+            read_frames = self._select if layer_idx == self.select_layer else self._selected
         if layer_idx in self.caches["register"]:
-            return stream_block(block, x, self.caches["register"][layer_idx], self.t, pos=pos)
-        return stream_block(block, x, self.caches["global"][layer_idx], self.t, grid_hw=self.grid_hw, pos=pos)
+            return stream_block(block, x, self.caches["register"][layer_idx], self.t, pos=pos, read_frames=read_frames,
+                                train=self.train)
+        return stream_block(block, x, self.caches["global"][layer_idx], self.t, grid_hw=self.grid_hw, pos=pos,
+                            read_frames=read_frames, train=self.train)
 
     def run_camera(self, iteration: int, index: int, block, x: Tensor) -> Tensor:
         """Camera-trunk block ``index`` of refinement ``iteration`` on the frame's camera token."""
-        return stream_block(block, x, self.caches["camera"][iteration][index], self.t)
+        read_frames = self._selected if self.retrieve_camera else None
+        return stream_block(block, x, self.caches["camera"][iteration][index], self.t, read_frames=read_frames,
+                            train=self.train)
+
+    def _select(self, q: Tensor, k: Tensor) -> Tensor:
+        self.frames = self.retriever.select(q, k, self.t)
+        return self.frames
+
+    def _selected(self, q: Tensor, k: Tensor) -> Tensor:
+        if self.frames is None:
+            raise RuntimeError(f"the frames of step {self.t} are selected in global layer {self.select_layer}, "
+                               "which has not run yet")
+        return self.frames
 
 
 def first_frame_depth_scale(depth: Tensor, mask: Tensor) -> Tensor:
@@ -86,23 +134,37 @@ def first_frame_depth_scale(depth: Tensor, mask: Tensor) -> Tensor:
 class StreamingOmega:
     """Frame-by-frame inference of a frame-causal ``OmniVGGTOmega`` with per-layer KV caches.
 
-    ``policy`` bounds every cache (see ``CachePolicy``). The backbone caches (global and register layers) store
-    ``dtype`` (default: the model's parameter dtype); the camera caches store the camera head's parameter dtype,
-    the dtype it computes in (``OmniVGGTOmega`` runs its heads without autocast). The caches are built at t=1
-    from the model (one per aggregator layer, trunk_depth x refinement iterations for the camera head) and the
-    frame size.
+    ``policy`` bounds every cache (see ``CachePolicy``); a retrieve policy keeps full caches and a
+    ``FrameRetriever`` (``retriever``, one stream: batch size 1) that selects the frames each step reads. The
+    backbone caches (global and register layers) store ``dtype`` (default: the model's parameter dtype); the
+    camera caches store the camera head's parameter dtype, the dtype it computes in (``OmniVGGTOmega`` runs its
+    heads without autocast). The caches are built at t=1 from the model (one per aggregator layer, trunk_depth x
+    refinement iterations for the camera head) and the frame size.
+
+    ``train=True`` trains on the stream (see the module docstring): ``step`` keeps the gradients and returns every
+    prediction of the model (``pose_enc_list`` included, for ``MultitaskLoss``), and the model may be in training
+    mode.
     """
 
-    def __init__(self, model, policy: CachePolicy, dtype: Optional[torch.dtype] = None):
+    def __init__(self, model, policy: CachePolicy, dtype: Optional[torch.dtype] = None, train: bool = False):
         aggregator, head = model.aggregator, model.camera_head
         if not (aggregator.causal and head.causal):
             raise ValueError("streaming runs the frame-causal model: build it with causal=True")
         if aggregator.depth_norm != "first_frame":
             raise ValueError("streaming fixes the depth scale at frame 1: build the model with depth_norm='first_frame'")
-        if model.training:
-            raise ValueError("streaming runs the model in eval mode: call model.eval() first")
+        if model.training and not train:
+            raise ValueError("streaming runs the model in eval mode: call model.eval() first, or stream with "
+                             "train=True to train")
+        if policy.retrieve_frames is not None:
+            registers = aggregator.register_attention_layers
+            first_global = min(i for i in range(aggregator.depth) if i not in registers)
+            if any(i < first_global for i in registers):
+                raise ValueError(f"retrieval selects the frames in the first inter-frame layer, which must be a "
+                                 f"global layer with the patch tokens: register layers {sorted(registers)} come "
+                                 f"before layer {first_global}")
         self.model = model
         self.policy = policy
+        self.train = train
         self.dtype = dtype if dtype is not None else aggregator.camera_token.dtype
         self.camera_dtype = head.empty_pose_tokens.dtype
         self.reset()
@@ -117,14 +179,20 @@ class StreamingOmega:
         self.depth_scale = None
         self.image_hw = None
         self.caches = None
+        self.retriever = None
         self._failed = False
 
-    @torch.no_grad()
     def step(self, image: Tensor, depth: Optional[Tensor] = None, mask: Optional[Tensor] = None) -> Dict[str, Tensor]:
         """Process the next frame: ``image`` [B, 3, H, W] in [0, 1], with ``depth`` [B, H, W, 1] and ``mask``
         [B, H, W] (RGB-D) or without both (RGB). Returns pose_enc [B, 1, 9], depth [B, 1, H, W, 1], depth_conf
-        [B, 1, H, W] and world_points [B, 1, H, W, 3] of this frame.
+        [B, 1, H, W] and world_points [B, 1, H, W, 3] of this frame; with ``train`` every prediction of the model
+        (``OmniVGGTOmega._predict``: also pose_enc_list and images), computed with gradients.
         """
+        with contextlib.nullcontext() if self.train else torch.no_grad():
+            predictions = self._step(image, depth, mask)
+        return predictions if self.train else {key: predictions[key] for key in STEP_OUTPUTS}
+
+    def _step(self, image: Tensor, depth: Optional[Tensor], mask: Optional[Tensor]) -> Dict[str, Tensor]:
         if self._failed:
             raise RuntimeError("a previous step failed and left the caches inconsistent: call reset()")
         batch, image_hw, depth_scale = self._check_step_inputs(image, depth, mask)
@@ -139,7 +207,8 @@ class StreamingOmega:
         patch = self.model.aggregator.patch_size
         grid_hw = (image_hw[0] // patch, image_hw[1] // patch)
         caches = self.caches if t > 1 else self._new_caches(grid_hw)
-        context = _StreamContext(t, depth_scale, grid_hw, caches)
+        retriever = self.retriever if t > 1 else self._new_retriever()
+        context = _StreamContext(t, depth_scale, grid_hw, caches, retriever, self.policy.retrieve_camera, self.train)
         aggregator, head = self.model.aggregator, self.model.camera_head
         aggregator._stream = head._stream = context
         try:
@@ -152,7 +221,8 @@ class StreamingOmega:
         finally:
             aggregator._stream = head._stream = None
         self.t, self.depth_scale, self.image_hw, self.caches = t, depth_scale, image_hw, caches
-        return {key: predictions[key] for key in STEP_OUTPUTS}
+        self.retriever = retriever
+        return predictions
 
     def kv_bytes(self) -> int:
         """Bytes stored in all caches (``LayerKVCache.nbytes``)."""
@@ -181,9 +251,11 @@ class StreamingOmega:
         register_layers = aggregator.register_attention_layers
 
         sized = {} if self.max_frames is None else {"initial_frames": self.max_frames}
+        # a retrieval stores every frame and reads the retrieved ones (``_StreamContext``)
+        policy = CachePolicy.full() if self.policy.retrieve_frames is not None else self.policy
 
         def cache(tokens_per_frame, special_count, dtype, layer_id):
-            return LayerKVCache(self.policy, tokens_per_frame, special_count, dtype, layer_id, **sized)
+            return LayerKVCache(policy, tokens_per_frame, special_count, dtype, layer_id, **sized)
 
         return {
             "global": {i: cache(tokens, special, self.dtype, i)
@@ -192,6 +264,11 @@ class StreamingOmega:
             "camera": [[cache(1, 1, self.camera_dtype, aggregator.depth + i * head.trunk_depth + j)
                         for j in range(head.trunk_depth)] for i in range(NUM_ITERATIONS)],
         }
+
+    def _new_retriever(self) -> Optional[FrameRetriever]:
+        if self.policy.retrieve_frames is None:
+            return None
+        return FrameRetriever(self.policy.retrieve_frames, self.model.aggregator.patch_start_idx)
 
 
 def all_caches(caches: Dict):

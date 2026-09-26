@@ -8,26 +8,38 @@ allows for the next step. Frame ids start at 1 and are consecutive; token ids nu
 
 A bounded cache is partitioned (design doc §4; no row is in two parts) into
 
-* anchor: every token of frame 1, always kept;
-* recent: every token of the ``recent`` newest frames (the current one included, frame 1 excluded);
+* anchor: every token of frame 1, always kept, and with ``anchor_every`` = A of the newest ``max_anchors`` frames
+  1 + kA (k >= 1), each promoted at its own step; a demoted anchor becomes a long-term candidate;
+* recent: every token of the ``recent`` newest frames (the current one included, the anchors excluded);
 * long-special: the special tokens of at most ``long_special`` other frames, selected per frame;
-* long-patch: at most ``long_patch`` other patch tokens, selected per token.
+* long-patch: at most ``long_patch`` other patch tokens, selected per token, or (``long_frames``) every patch
+  token of at most ``long_frames`` other frames, selected per frame (IncVGGT-style whole frames).
 
 The long-term stores are selected at the commit, from every candidate of the written cache, by the policy's
-selector; ties go to the newer frame, then to the smaller token id. With ``quant`` the long-patch store keeps
+selector; ties go to the newer frame, then to the smaller token id. A frame is ranked by the mean score of its
+candidate rows. The ``diversity`` selector (InfiniteVGGT-style, query-free) ranks the long-patch candidates only;
+the long-special frames are then chosen by the ``query`` selector. With ``quant`` the long-patch store keeps
 INT8/INT4 codes (asymmetric, design doc §6): a token is quantised once, when it enters the store, and keeps its
 codes and block scale/offset until it is evicted; the other parts stay in the cache dtype.
+
+A retrieve policy (``retrieve_frames``) is applied by ``StreamingOmega`` (``omnivggt.stream.retrieve``): its caches
+are full caches, and each step reads only the frames the retrieval selected (``LayerKVCache.read(frames)``).
+
+The stored keys and values are always detached. Training on the stream reads the current frame's keys and values
+with their gradient in place of its stored rows (``LayerKVCache.read(current=...)``): the gradient of a step goes
+through the current frame only.
 """
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
-SELECTOR_NAMES = ("query", "xstream", "recency", "random")
+SELECTOR_NAMES = ("query", "xstream", "recency", "random", "diversity")
 QUANT_BITS = {"int8": 8, "int4": 4}
 QUANT_NAMES = tuple(QUANT_BITS)
 QUANT_BLOCK = 64  # K: tokens of one channel per scale/offset; V: channels of one token
@@ -43,12 +55,18 @@ def _is_int(value) -> bool:
 class CachePolicy:
     """What every cache of a stream keeps.
 
-    * ``recent`` (w >= 1): the w newest frames besides the anchor. ``None`` is the full cache: every frame is kept,
-      and nothing else may be set.
+    * ``recent`` (w >= 1): the w newest frames besides the anchor. ``None`` keeps every frame: the full cache, or
+      with ``retrieve_frames`` a retrieval; nothing else may be set.
     * ``long_special`` (k_U): special tokens of at most k_U other frames.
     * ``long_patch`` (b_P): at most b_P other patch tokens (layers without patches ignore it).
+    * ``long_frames`` (k_P): instead of ``long_patch``, every patch token of at most k_P other frames.
     * ``selector``: one of ``SELECTOR_NAMES``; required exactly when there is a long-term store.
     * ``quant``: ``"int8"`` or ``"int4"`` storage of the long-patch store.
+    * ``anchor_every`` (A) and ``max_anchors`` (n_anchor), together or neither: frame 1 + kA becomes an anchor at
+      step 1 + kA, and the newest n_anchor of them are kept whole besides frame 1.
+    * ``retrieve_frames`` (N, with ``recent=None``): every frame is stored, and each step reads the anchor, N-1
+      past frames retrieved for it and the current frame (``omnivggt.stream.retrieve``) in every global and
+      register layer; the camera trunk reads its full history, or with ``retrieve_camera`` the same frames.
     """
 
     recent: Optional[int]
@@ -56,28 +74,54 @@ class CachePolicy:
     long_patch: int = 0
     selector: Optional[str] = None
     quant: Optional[str] = None
+    long_frames: int = 0
+    anchor_every: Optional[int] = None
+    max_anchors: Optional[int] = None
+    retrieve_frames: Optional[int] = None
+    retrieve_camera: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.retrieve_camera, bool):
+            raise ValueError(f"retrieve_camera must be a bool, got {self.retrieve_camera!r}")
+        if self.retrieve_camera and self.retrieve_frames is None:
+            raise ValueError("retrieve_camera restricts the camera caches to the retrieved frames: set retrieve_frames")
         if self.recent is None:
-            if (self.long_special, self.long_patch, self.selector, self.quant) != (0, 0, None, None):
+            others = (self.long_special, self.long_patch, self.long_frames, self.selector, self.quant,
+                      self.anchor_every, self.max_anchors)
+            if others != (0, 0, 0, None, None, None, None):
                 raise ValueError("the full cache (recent=None) keeps every frame: it takes no long-term store, "
-                                 "selector or quantisation")
+                                 "selector, quantisation or periodic anchor")
+            if self.retrieve_frames is not None and (not _is_int(self.retrieve_frames) or self.retrieve_frames < 1):
+                raise ValueError(f"retrieve_frames must be an int >= 1, got {self.retrieve_frames!r}")
             return
+        if self.retrieve_frames is not None:
+            raise ValueError(f"retrieval reads from the full history: it takes recent=None, got {self.recent!r}")
         if not _is_int(self.recent) or self.recent < 1:
             raise ValueError(f"recent must be an int >= 1 (it includes the current frame), got {self.recent!r}")
-        for name in ("long_special", "long_patch"):
+        if (self.anchor_every is None) != (self.max_anchors is None):
+            raise ValueError("periodic anchors take both anchor_every and max_anchors (or neither), got "
+                             f"anchor_every={self.anchor_every!r}, max_anchors={self.max_anchors!r}")
+        if self.anchor_every is not None:
+            for name in ("anchor_every", "max_anchors"):
+                value = getattr(self, name)
+                if not _is_int(value) or value < 1:
+                    raise ValueError(f"{name} must be an int >= 1, got {value!r}")
+        for name in ("long_special", "long_patch", "long_frames"):
             value = getattr(self, name)
             if not _is_int(value) or value < 0:
                 raise ValueError(f"{name} must be an int >= 0, got {value!r}")
-        has_long_term = self.long_special > 0 or self.long_patch > 0
+        if self.long_patch > 0 and self.long_frames > 0:
+            raise ValueError("the long-patch store keeps tokens (long_patch) or whole frames (long_frames), not both")
+        has_long_patch = self.long_patch > 0 or self.long_frames > 0
+        has_long_term = self.long_special > 0 or has_long_patch
         if has_long_term and self.selector not in SELECTOR_NAMES:
             raise ValueError(f"a long-term store needs a selector from {SELECTOR_NAMES}, got {self.selector!r}")
         if not has_long_term and self.selector is not None:
             raise ValueError(f"selector {self.selector!r} given, but there is no long-term store to select")
         if self.quant is not None and self.quant not in QUANT_NAMES:
             raise ValueError(f"quant must be None or one of {QUANT_NAMES}, got {self.quant!r}")
-        if self.quant is not None and self.long_patch == 0:
-            raise ValueError("quant applies to the long-patch store only, but long_patch=0")
+        if self.quant is not None and not has_long_patch:
+            raise ValueError("quant applies to the long-patch store only, but long_patch=0 and long_frames=0")
 
     @classmethod
     def full(cls) -> "CachePolicy":
@@ -96,15 +140,40 @@ class CachePolicy:
 
     @property
     def is_full(self) -> bool:
-        return self.recent is None
+        return self.recent is None and self.retrieve_frames is None
 
     def budget(self, tokens_per_frame: int, special_count: int) -> Optional[int]:
-        """Most tokens a cache keeps between steps: (1+w)n + m k_U + b_P, or m(1+w+k_U) without patches
-        (register layers: n = m; camera trunk: n = m = 1). None for the full cache."""
-        if self.is_full:
+        """Most tokens a cache keeps between steps: (1+n_anchor+w)n + m k_U + b_P (b_P = k_P (n-m) with whole
+        frames), or m(1+n_anchor+w+k_U) without patches (register layers: n = m; camera trunk: n = m = 1). None
+        when every frame is kept (the full cache, a retrieval)."""
+        if self.recent is None:
             return None
-        patches = self.long_patch if tokens_per_frame > special_count else 0
-        return (1 + self.recent) * tokens_per_frame + special_count * self.long_special + patches
+        return ((1 + self.extra_anchors + self.recent) * tokens_per_frame + special_count * self.long_special
+                + self.long_patch_capacity(tokens_per_frame - special_count))
+
+    @property
+    def extra_anchors(self) -> int:
+        """n_anchor: the most promoted anchors kept besides frame 1."""
+        return 0 if self.anchor_every is None else self.max_anchors
+
+    def anchor_frames(self, t: int) -> List[int]:
+        """Anchors after the commit of step ``t``: frame 1 and the newest ``max_anchors`` frames 1 + kA <= t."""
+        if self.anchor_every is None:
+            return [1]
+        return [1, *range(1 + self.anchor_every, t + 1, self.anchor_every)[-self.max_anchors:]]
+
+    def protected_frames(self, t: int) -> List[int]:
+        """Frames kept whole after the commit of step ``t`` (ascending): all of them when every frame is kept, else
+        the anchors and the ``recent`` newest frames."""
+        if self.recent is None:
+            return list(range(1, t + 1))
+        return sorted({*self.anchor_frames(t), *range(max(2, t - self.recent + 1), t + 1)})
+
+    def long_patch_capacity(self, patches: int) -> int:
+        """Most long-patch tokens of a layer with ``patches`` patch tokens per frame: b_P, or k_P whole frames."""
+        if patches == 0:
+            return 0
+        return self.long_patch + self.long_frames * patches
 
 
 @dataclass(frozen=True)
@@ -119,6 +188,7 @@ class Candidates:
     grid_hw: Optional[Tuple[int, int]]  # patch grid (rows, columns) of a frame; None without patches
     layer_id: int
     t: int
+    pool: Optional[Tensor] = None  # [N] bool, the long-patch candidates (the diversity selector's pool)
 
 
 def query_groups(special_count: int, grid_hw: Optional[Tuple[int, int]]) -> Tensor:
@@ -191,7 +261,20 @@ def select_random(candidates: Candidates) -> Tensor:
     return torch.from_numpy(generator.random(candidates.frame_id.numel())).to(candidates.frame_id.device)
 
 
-SELECTORS = {"query": select_query, "xstream": select_xstream, "recency": select_recency, "random": select_random}
+def select_diversity(candidates: Candidates) -> Tensor:
+    """InfiniteVGGT's query-free diversity of every row: s_j = -(1/H) sum_h cos(k_{h,j}, mu_h), mu_h the mean of
+    the unit keys khat = k / |k| of the pool (the long-patch candidates). One score per row, so every head keeps
+    the same rows; rows far from the pool's mean direction are kept first."""
+    pool = candidates.pool
+    if pool is None or not bool(pool.any()):
+        raise ValueError("the diversity selector scores against the long-patch pool: give a non-empty pool")
+    unit = F.normalize(candidates.keys.to(_score_dtype(candidates)), dim=-1)  # [1, H, N, D]
+    direction = F.normalize(unit[:, :, pool].mean(dim=2, keepdim=True), dim=-1)  # [1, H, 1, D]
+    return -(unit * direction).sum(dim=-1).mean(dim=1)[0]
+
+
+SELECTORS = {"query": select_query, "xstream": select_xstream, "recency": select_recency, "random": select_random,
+             "diversity": select_diversity}
 
 
 def _ranked(scores: Tensor, frame_id: Tensor, token_id: Tensor) -> Tensor:
@@ -357,6 +440,9 @@ class LayerKVCache:
             raise ValueError(f"need 1 <= special_count <= tokens_per_frame, got {special_count}, {tokens_per_frame}")
         if initial_frames < 1:
             raise ValueError(f"initial_frames must be positive, got {initial_frames}")
+        if policy.retrieve_frames is not None:
+            raise ValueError("a retrieve policy is applied by StreamingOmega: its layer caches are full caches "
+                             "(CachePolicy.full()) read at the retrieved frames")
         self.policy = policy
         self.tokens_per_frame = tokens_per_frame
         self.special_count = special_count
@@ -372,7 +458,8 @@ class LayerKVCache:
         if policy.is_full:
             self._initial_rows = initial_frames * tokens_per_frame
         else:
-            self._initial_rows = self.budget + tokens_per_frame - (policy.long_patch if self._quant else 0)
+            quantized = policy.long_patch_capacity(tokens_per_frame - special_count) if self._quant else 0
+            self._initial_rows = self.budget + tokens_per_frame - quantized
         self._pending = None  # frame id appended but not committed yet
         self._keys = self._values = None  # [B, H, capacity, D], allocated on the first append
         self._frame_id = self._token_id = None  # [capacity] int64, row metadata
@@ -393,7 +480,8 @@ class LayerKVCache:
         return 0 if self._quant is None else self._quant.rows
 
     def append(self, k: Tensor, v: Tensor, frame_id: int) -> None:
-        """Write the current frame's keys and values ([B, H, n, D]) after the stored rows."""
+        """Write the current frame's keys and values ([B, H, n, D]) after the stored rows, detached: the cache
+        never holds an autograd graph (training reads the current frame with ``read(current=...)``)."""
         if self._pending is not None:
             raise RuntimeError(f"frame {self._pending} was appended but not committed: commit before the next append")
         if frame_id != self.last_frame + 1:
@@ -410,23 +498,55 @@ class LayerKVCache:
             raise ValueError(f"keys of shape {tuple(k.shape)} do not match the cache {tuple(self._keys.shape)}")
         self._reserve(self._rows + self.tokens_per_frame)
         rows = slice(self._rows, self._rows + self.tokens_per_frame)
-        self._keys[:, :, rows] = k.to(self.dtype)
-        self._values[:, :, rows] = v.to(self.dtype)
+        self._keys[:, :, rows] = k.detach().to(self.dtype)
+        self._values[:, :, rows] = v.detach().to(self.dtype)
         self._frame_id[rows] = frame_id
         self._token_id[rows] = torch.arange(self.tokens_per_frame, device=self._token_id.device)
         self._rows += self.tokens_per_frame
         self._pending = frame_id
 
-    def read(self) -> Tuple[Tensor, Tensor]:
+    def read(self, frames: Optional[Tensor] = None, current: Optional[Tuple[Tensor, Tensor]] = None
+             ) -> Tuple[Tensor, Tensor]:
         """Keys and values of every stored row, in the order of ``row_ids``: views of the buffer, followed by the
-        dequantised long-patch store if there is one."""
+        dequantised long-patch store if there is one. ``frames`` (frame ids, all stored) reads the rows of those
+        frames only, in the same order; naming every stored frame reads the same views.
+
+        ``current`` (training on the stream): the keys and values [B, H, n, D] of the appended, not yet committed
+        frame, read in place of its stored rows (cast to the cache dtype, so the values are the same) with their
+        gradient; the past rows stay detached, and the result is a new tensor, never a view of the buffer.
+        """
         if self._keys is None:
             raise RuntimeError("the cache is empty: append a frame first")
         keys, values = self._keys[:, :, : self._rows], self._values[:, :, : self._rows]
-        if not self._quantized_rows:
+        if current is not None:
+            keys, values = self._with_current(keys, values, *current)
+        if self._quantized_rows:
+            quantized_keys, quantized_values = self._quant.dequantized()
+            keys, values = torch.cat([keys, quantized_keys], dim=2), torch.cat([values, quantized_values], dim=2)
+        if frames is None:
             return keys, values
-        quantized_keys, quantized_values = self._quant.dequantized()
-        return torch.cat([keys, quantized_keys], dim=2), torch.cat([values, quantized_values], dim=2)
+        frame_id = self.row_ids()[0]
+        frames = frames.to(frame_id.device)
+        if not bool(torch.isin(frames, frame_id).all()):
+            raise ValueError(f"frames {frames.tolist()} are not all stored (the cache holds frames up to "
+                             f"{int(frame_id.max())})")
+        rows = torch.isin(frame_id, frames)
+        if bool(rows.all()):
+            return keys, values
+        rows = rows.nonzero().squeeze(1)
+        return keys[:, :, rows], values[:, :, rows]
+
+    def _with_current(self, keys: Tensor, values: Tensor, k: Tensor, v: Tensor) -> Tuple[Tensor, Tensor]:
+        """The buffer rows ``keys``/``values`` with the pending frame's rows (the last n) replaced by ``k``/``v``."""
+        if self._pending is None:
+            raise RuntimeError("no pending frame to read with its gradient: append the current frame first")
+        stored = (*keys.shape[:2], self.tokens_per_frame, keys.shape[3])
+        if k.shape != stored or v.shape != stored:
+            raise ValueError(f"the current frame's keys and values must have the stored shape {stored}, "
+                             f"got {tuple(k.shape)} and {tuple(v.shape)}")
+        past = self._rows - self.tokens_per_frame
+        return (torch.cat([keys[:, :, :past], k.to(self.dtype)], dim=2),
+                torch.cat([values[:, :, :past], v.to(self.dtype)], dim=2))
 
     def row_ids(self) -> Tuple[Tensor, Tensor]:
         """Frame id and token id of every row of ``read()``."""
@@ -462,8 +582,7 @@ class LayerKVCache:
         n, m, t = self.tokens_per_frame, self.special_count, self.last_frame
         frame_id, token_id = self.row_ids()
         keys, values = self.read()
-        recent_from = 1 if self.policy.is_full else max(2, t - self.policy.recent + 1)
-        protected_frames = [frame for frame in range(1, t + 1) if frame == 1 or frame >= recent_from]
+        protected_frames = self.policy.protected_frames(t)
         protected = torch.isin(frame_id, torch.tensor(protected_frames, device=frame_id.device))
         special = token_id < m
         long_special_frames, special_counts = torch.unique(frame_id[~protected & special], return_counts=True)
@@ -478,8 +597,12 @@ class LayerKVCache:
             "protected_complete": unique and int(protected.sum()) == n * len(protected_frames),
             "long_special": long_special_frames.numel() <= self.policy.long_special
             and bool((special_counts == m).all()),
-            "long_patch": long_patch_tokens <= (self.policy.long_patch if n > m else 0),
+            "long_patch": long_patch_tokens <= self.policy.long_patch_capacity(n - m),
         }
+        if self.policy.long_frames:  # whole frames: every patch of at most k_P frames
+            long_patch_frames, patch_counts = torch.unique(frame_id[long_patch], return_counts=True)
+            checks["long_frames"] = (long_patch_frames.numel() <= self.policy.long_frames
+                                     and bool((patch_counts == n - m).all()))
         if self._quant is not None:  # the long-patch rows are exactly the quantised ones, and their blocks live
             quantized = torch.zeros_like(long_patch)
             quantized[self._rows:] = True  # row_ids lists the quantised store after the buffer
@@ -501,24 +624,36 @@ class LayerKVCache:
         """Rows (bool masks over ``row_ids``) kept after the commit of step ``t``, and the long-patch candidates."""
         policy = self.policy
         frame_id, token_id = self.row_ids()
-        protected = (frame_id == 1) | (frame_id > t - policy.recent)
+        protected = torch.isin(frame_id, torch.tensor(policy.protected_frames(t), device=frame_id.device))
         special = token_id < self.special_count
         long_special, long_patch = ~protected & special, ~protected & ~special
         select_special = torch.unique(frame_id[long_special]).numel() > policy.long_special
-        select_patch = int(long_patch.sum()) > policy.long_patch
+        if policy.long_frames:
+            select_patch = torch.unique(frame_id[long_patch]).numel() > policy.long_frames
+        else:
+            select_patch = int(long_patch.sum()) > policy.long_patch
         keep = protected.clone()
-        if not (select_special or select_patch):  # fewer candidates than the budget: keep them all
-            return keep | long_special | long_patch, long_patch
-        scores = self._scores(q, t, grid_hw)
-        if select_special:
-            kept_frames = top_frames(scores, frame_id, long_special, policy.long_special)
-            keep |= long_special & torch.isin(frame_id, kept_frames)
-        else:
+        scores = {}  # per selector, computed at most once per commit, and only when a store must select
+
+        def scored(selector: str) -> Tensor:
+            if selector not in scores:
+                scores[selector] = self._scores(selector, q, t, grid_hw, long_patch)
+            return scores[selector]
+
+        # a store keeps every candidate while they fit; a store of size 0 keeps none (nothing to score)
+        if not select_special:
             keep |= long_special
-        if select_patch:
-            keep[top_rows(scores, frame_id, token_id, long_patch, policy.long_patch)] = True
-        else:
+        elif policy.long_special > 0:  # diversity ranks the patches only: the special tokens keep the query selector
+            special_selector = "query" if policy.selector == "diversity" else policy.selector
+            kept_frames = top_frames(scored(special_selector), frame_id, long_special, policy.long_special)
+            keep |= long_special & torch.isin(frame_id, kept_frames)
+        if not select_patch:
             keep |= long_patch
+        elif policy.long_frames > 0:
+            kept_frames = top_frames(scored(policy.selector), frame_id, long_patch, policy.long_frames)
+            keep |= long_patch & torch.isin(frame_id, kept_frames)
+        elif policy.long_patch > 0:
+            keep[top_rows(scored(policy.selector), frame_id, token_id, long_patch, policy.long_patch)] = True
         return keep, long_patch
 
     def _keep(self, keep: Tensor, long_patch: Tensor) -> None:
@@ -537,12 +672,13 @@ class LayerKVCache:
         keep_buffer[entering] = False
         self._compact(keep_buffer)
 
-    def _scores(self, q: Tensor, t: int, grid_hw: Optional[Tuple[int, int]]) -> Tensor:
+    def _scores(self, selector: str, q: Tensor, t: int, grid_hw: Optional[Tuple[int, int]], pool: Tensor) -> Tensor:
         frame_id, token_id = self.row_ids()
-        candidates = Candidates(q, self.read()[0], frame_id, token_id, self.special_count, grid_hw, self.layer_id, t)
-        scores = SELECTORS[self.policy.selector](candidates)
+        candidates = Candidates(q, self.read()[0], frame_id, token_id, self.special_count, grid_hw, self.layer_id, t,
+                                pool)
+        scores = SELECTORS[selector](candidates)
         if not torch.isfinite(scores).all():
-            raise ValueError(f"selector {self.policy.selector!r} gave non-finite scores at layer {self.layer_id}")
+            raise ValueError(f"selector {selector!r} gave non-finite scores at layer {self.layer_id}")
         return scores
 
     def _compact(self, keep: Tensor) -> None:

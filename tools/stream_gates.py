@@ -99,8 +99,8 @@ def _long_patch_rows(cache) -> dict:
         return {}
     keys, values = cache.read()
     frame_id, token_id = cache.row_ids()
-    recent_from = max(2, cache.last_frame - cache.policy.recent + 1)
-    long_patch = (frame_id != 1) & (frame_id < recent_from) & (token_id >= cache.special_count)
+    protected = torch.tensor(cache.policy.protected_frames(cache.last_frame), device=frame_id.device)
+    long_patch = ~torch.isin(frame_id, protected) & (token_id >= cache.special_count)
     return {
         (int(frame_id[row]), int(token_id[row])): (keys[:, :, row].clone(), values[:, :, row].clone())
         for row in torch.nonzero(long_patch).flatten().tolist()

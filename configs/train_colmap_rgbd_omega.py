@@ -30,6 +30,8 @@
 #   OMNIVGGT_VIEW_SELECTION       random_topk (nearest poses) or sequential (ordered clips) views (default: random_topk)
 #   OMNIVGGT_SEQ_STRIDES          sequential only: comma-separated frame strides, one drawn per clip (default: 1)
 #   OMNIVGGT_FULL_CLIPS           1 makes every step one clip of all its images (default: 0)
+#   OMNIVGGT_DATA_SEED            ColmapRgbd sample seed (views, strides, crops; seed + sample index), a positive
+#                                 integer (default: 985); another value draws other clips from the same anchors
 #
 # The image encoder is OmniVGGT's DINOv2 (14-pixel patches), so the 384x288 staging images are
 # trained at 392x294 exactly as for OmniVGGT (same 4:3 aspect ratio, 28x21 patches); 640x480 staging
@@ -101,6 +103,10 @@ sequential_strides = [int(s) for s in _strides.split(",")]
 if view_selection != "sequential" and sequential_strides != [1]:
     raise ValueError("OMNIVGGT_SEQ_STRIDES applies only to OMNIVGGT_VIEW_SELECTION=sequential")
 full_clips = bool(int("{{$OMNIVGGT_FULL_CLIPS:0}}"))
+_data_seed = "{{$OMNIVGGT_DATA_SEED:985}}"
+if not (_data_seed.isdigit() and int(_data_seed) > 0):  # ColmapRgbd draws unseeded samples for a seed of 0
+    raise ValueError(f"OMNIVGGT_DATA_SEED must be a positive integer, got {_data_seed!r}")
+data_seed = int(_data_seed)
 train_batch_images = int("{{$OMNIVGGT_TRAIN_BATCH_IMAGES:12}}")
 num_workers = 8
 steps_per_epoch = int("{{$OMNIVGGT_STEPS_PER_EPOCH:1000}}")
@@ -164,5 +170,5 @@ _views = "" if view_selection == "random_topk" else (
 )
 train_dataset = (
     f"{steps_per_epoch} @ ColmapRgbd(roots={colmap_rgbd_roots!r}, split='train', top_k=32, z_far=2, "
-    f"aug_crop=16, resolution={resolution}, transform=ColorJitter, seed=985{_views})"
+    f"aug_crop=16, resolution={resolution}, transform=ColorJitter, seed={data_seed}{_views})"
 )
