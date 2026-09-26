@@ -53,11 +53,12 @@ class OmegaStyleAggregator(ZeroAggregator):
 
     def _process_global_attention(
         self, tokens, B, S, P, C, global_idx, pos=None, pose_encoding=None, depth_encoding=None, attn_mask=None,
-        visibility=None,
+        visibility=None, frame_only_layers=frozenset(),
     ):
         if global_idx not in self.register_attention_layers:
             return super()._process_global_attention(
-                tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask, visibility=visibility
+                tokens, B, S, P, C, global_idx, pos=pos, attn_mask=attn_mask, visibility=visibility,
+                frame_only_layers=frame_only_layers,
             )
         prefix = self.patch_start_idx
         tokens = tokens.reshape(B, S, P, C)

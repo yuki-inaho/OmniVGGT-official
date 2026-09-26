@@ -639,3 +639,99 @@ def test_band_over_a_long_window_builds_no_token_mask(monkeypatch):
     assert (LONG_FRAMES * special,) * 2 in watch.shapes  # the register layer's [S*m, S*m] mask: the watch saw the run
     assert out["pose_enc"].shape == (1, LONG_FRAMES, 9)
     assert all(torch.isfinite(out[key]).all() for key in OUTPUTS)
+
+
+# --- G2F: global layers that attend within each frame only (frame_only_layers) ------------------------------
+
+DENSE_LAYERS = (0, 2, 3)  # TINY's global layers besides the register layer 1
+
+
+@pytest.mark.parametrize("rope", [False, True])
+def test_frame_only_layer_equals_the_layer_under_the_eye_visibility_mask(rope):
+    torch.manual_seed(0)
+    aggregator = OmniVGGTOmega(**{**TINY, "global_rope": rope}).double().eval().aggregator
+    frames, layer, batch = 5, 2, 2
+    generator = torch.Generator().manual_seed(1)
+    x = torch.randn(batch, frames * TOKENS_PER_FRAME, 32, generator=generator, dtype=torch.float64)
+    pos = torch.randint(0, 5, (batch, frames * TOKENS_PER_FRAME, 2), generator=generator)
+    eye = frame_visibility_mask(torch.eye(frames, dtype=torch.bool), TOKENS_PER_FRAME)
+    with torch.no_grad():
+        got, next_layer, intermediates = aggregator._process_global_attention(
+            x, batch, frames, TOKENS_PER_FRAME, 32, layer, pos=pos, frame_only_layers=frozenset({layer})
+        )
+        want = aggregator.global_blocks[layer](x, pos=pos, attn_mask=eye)
+    assert next_layer == layer + 1 and len(intermediates) == 1
+    assert torch.equal(intermediates[0], got.view(batch, frames, TOKENS_PER_FRAME, 32))
+    torch.testing.assert_close(got, want, rtol=0, atol=1e-10)
+
+
+@pytest.mark.parametrize("condition", list(DEPTH_INDEX))
+def test_frame_only_layers_equal_the_gathered_eye_visibility(condition):
+    model, inputs = _model(depth_norm="first_frame"), _inputs()
+    eye = torch.eye(FRAMES, dtype=torch.bool)
+    got = _infer_visible(model, inputs, condition, frame_visibility=eye, frame_only_layers=DENSE_LAYERS)
+    want = _infer_visible(model, inputs, condition, frame_visibility=eye)
+    for key in OUTPUTS:
+        assert _max_relative_error(got[key], want[key]) <= 1e-10, key
+
+
+def _frame_independent(frames=FRAMES):
+    """Options that make every inter-frame layer attend within the frame: frame-only dense layers, and the eye
+    visibility for the register layers and the camera trunk."""
+    return dict(frame_visibility=torch.eye(frames, dtype=torch.bool), frame_only_layers=DENSE_LAYERS)
+
+
+@pytest.mark.parametrize("condition", list(DEPTH_INDEX))
+def test_frame_independent_model_outputs_ignore_the_other_frames(condition):
+    model, inputs, replaced = _model(depth_norm="first_frame"), _inputs(), 2
+    out = _infer_visible(model, inputs, condition, **_frame_independent())
+    changed = _infer_visible(model, _replace_frame(inputs, replaced), condition, **_frame_independent())
+    for frame in range(FRAMES):
+        for key in OUTPUTS:
+            assert torch.equal(out[key][:, frame], changed[key][:, frame]) is (frame != replaced), (key, frame)
+
+
+@pytest.mark.parametrize("condition", list(DEPTH_INDEX))
+def test_frame_independent_model_frame_0_is_the_single_frame_model(condition):
+    """Frame 0 only: the later frames take the non-reference special tokens, which S=1 inference never uses."""
+    model, inputs = _model(depth_norm="first_frame"), _inputs()
+    out = _infer_visible(model, inputs, condition, **_frame_independent())
+    alone = _infer_visible(model, {key: value[:, :1] for key, value in inputs.items()}, condition)
+    for key in OUTPUTS:
+        assert _max_relative_error(out[key][:, :1], alone[key]) <= 1e-10, key
+
+
+@pytest.mark.parametrize("condition", list(DEPTH_INDEX))
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("empty", [(), frozenset()])
+def test_no_frame_only_layers_is_the_default_model(condition, causal, empty):
+    model, inputs = _model(causal=causal, depth_norm="first_frame"), _inputs()
+    _assert_outputs_equal(_infer_visible(model, inputs, condition, frame_only_layers=empty),
+                          _infer_visible(model, inputs, condition))
+
+
+@pytest.mark.parametrize("condition", list(DEPTH_INDEX))
+def test_causal_model_with_frame_only_layers_stays_frame_causal(condition):
+    model, inputs = _model(causal=True, depth_norm="first_frame"), _inputs()
+    out = _infer_visible(model, inputs, condition, frame_only_layers=(0,))
+    changed = _infer_visible(model, _with_other_last_frame(inputs), condition, frame_only_layers=(0,))
+    for key in OUTPUTS:
+        assert torch.equal(out[key][:, PAST], changed[key][:, PAST]), key
+    assert not torch.equal(out["pose_enc"], _infer_visible(model, inputs, condition)["pose_enc"])
+
+
+@pytest.mark.parametrize(
+    "layers, match",
+    [((1,), "register"), ((0, 1), "register"), ((0, 4), "global layer"), ((-1,), "global layer"),
+     ((True,), "global layer"), ((0.0,), "global layer")],
+)
+def test_frame_only_layers_are_checked(layers, match):
+    with pytest.raises(ValueError, match=match):
+        _infer_visible(_model(depth_norm="first_frame"), _inputs(), "depth", frame_only_layers=layers)
+
+
+def test_stream_context_takes_no_frame_only_layers():
+    model = _model(causal=True, depth_norm="first_frame")
+    model.aggregator._stream = object()  # a streaming context runs one frame per call against its caches
+    with pytest.raises(ValueError, match="stream"):
+        _infer_visible(model, _inputs(frames=1), "rgb", frame_only_layers=(0,))
