@@ -25,6 +25,7 @@ class OmniVGGT(nn.Module, PyTorchModelHubMixin):
         intrinsics: torch.Tensor = None,
         depth: torch.Tensor = None,
         mask: torch.Tensor = None,
+        modality_rng=None,
     ):
 
         # If without batch dimension, add it
@@ -35,7 +36,8 @@ class OmniVGGT(nn.Module, PyTorchModelHubMixin):
                                                                   extrinsics = extrinsics, 
                                                                   intrinsics = intrinsics,
                                                                   depth = depth,
-                                                                  mask = mask,)
+                                                                  mask = mask,
+                                                                  modality_rng = modality_rng)
                             
         B, S, C_in, H, W = images.shape
         predictions = {}

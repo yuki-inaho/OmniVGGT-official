@@ -28,6 +28,15 @@ def test_depth_camera_inputs_are_fixed_and_well_formed():
     assert rgb["depth_gt_index"] == [] and rgb["camera_gt_index"] == [] and rgb["mask"] is None
 
 
+def test_depth_condition_uses_depth_but_not_camera():
+    depth = bench_inference.make_inputs(frames=3, height=28, width=42, condition="depth", device="cpu")
+    assert depth["depth_gt_index"] == [0, 1, 2] and depth["camera_gt_index"] == []
+    assert depth["depth"].shape == (1, 3, 28, 42, 1) and depth["mask"].shape == (1, 3, 28, 42)
+    assert bench_inference.build_parser().parse_args(
+        ["--random-weights", "--width", "644", "--height", "476", "--condition", "depth", "--output", "b.json"]
+    ).condition == "depth"
+
+
 def test_sections_include_unprojection_for_omega():
     import torch
 

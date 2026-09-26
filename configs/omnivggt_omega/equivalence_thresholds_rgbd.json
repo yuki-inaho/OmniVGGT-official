@@ -1,0 +1,13 @@
+{
+  "description": "Pre-registered criteria of equivalence_thresholds.json restricted to the conditions with depth input (RGB-D is a required input of the deployed system; added 2026-09-26). Metric thresholds and bootstrap settings are copied unchanged.",
+  "conditions": ["depth", "depth+camera"],
+  "metrics": {
+    "AUC@30": {"type": "min_delta", "value": -0.010},
+    "RTA@5": {"type": "min_delta", "value": -0.020},
+    "rot_err_mean_deg": {"type": "max_delta", "value": 0.05},
+    "trans_dir_err_mean_deg": {"type": "max_delta", "value": 0.30},
+    "abs_rel": {"type": "max_ratio_plus", "ratio": 1.10, "plus": 0.002},
+    "delta<1.25": {"type": "min_delta", "value": -0.010}
+  },
+  "bootstrap": {"resamples": 10000, "seed": 0, "level": 0.95}
+}

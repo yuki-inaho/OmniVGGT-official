@@ -7,7 +7,7 @@ every view. Peak memory is measured after the weights are resident (``peak_alloc
 
 usage: PYTHONPATH=tools uv run python -m bench_inference [--model-config VARIANT.json] \
            (--checkpoint W.safetensors|ACCELERATE_DIR | --random-weights) --width 392 --height 294 \
-           --frames 8 16 32 --condition rgb [--no-points] [--sections] --output bench.json
+           --frames 8 16 32 --condition rgb|depth|depth+camera [--no-points] [--sections] --output bench.json
 """
 
 from __future__ import annotations
@@ -54,13 +54,11 @@ def make_inputs(frames: int, height: int, width: int, condition: str, device) ->
         1, frames, 1, 1
     )
     if condition == "rgb":
-        depth, mask, views = torch.zeros(1, frames, height, width, 1), None, []
-    elif condition == "depth+camera":
-        depth, mask, views = (
-            torch.ones(1, frames, height, width, 1),
-            torch.ones(1, frames, height, width),
-            list(range(frames)),
-        )
+        depth, mask, depth_views, camera_views = torch.zeros(1, frames, height, width, 1), None, [], []
+    elif condition in ("depth", "depth+camera"):
+        depth, mask = torch.ones(1, frames, height, width, 1), torch.ones(1, frames, height, width)
+        depth_views = list(range(frames))
+        camera_views = list(range(frames)) if condition == "depth+camera" else []
     else:
         raise ValueError(f"unknown condition {condition!r}")
     move = lambda x: None if x is None else x.to(device)  # noqa: E731
@@ -70,8 +68,8 @@ def make_inputs(frames: int, height: int, width: int, condition: str, device) ->
         "intrinsics": move(intrinsics),
         "depth": move(depth),
         "mask": move(mask),
-        "depth_gt_index": views,
-        "camera_gt_index": list(views),
+        "depth_gt_index": depth_views,
+        "camera_gt_index": camera_views,
     }
 
 
@@ -118,7 +116,7 @@ def _time_sections(model, run) -> dict:
     return section_totals((name, start.elapsed_time(end)) for name, start, end in events)
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-config", type=Path, help="OmniVGGTOmega variant JSON (default: OmniVGGT)")
     weights = parser.add_mutually_exclusive_group(required=True)
@@ -129,7 +127,7 @@ def main() -> int:
     parser.add_argument("--width", type=int, required=True)
     parser.add_argument("--height", type=int, required=True)
     parser.add_argument("--frames", type=int, nargs="+", default=[8, 16, 32])
-    parser.add_argument("--condition", choices=["rgb", "depth+camera"], default="rgb")
+    parser.add_argument("--condition", choices=["rgb", "depth", "depth+camera"], default="rgb")
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument(
@@ -137,7 +135,11 @@ def main() -> int:
     )
     parser.add_argument("--sections", action="store_true", help="also time the modules in one extra forward")
     parser.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
     check_options(args.model_config, args.no_points)
     if args.output.exists():
         raise FileExistsError(args.output)

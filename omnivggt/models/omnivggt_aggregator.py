@@ -37,7 +37,8 @@ class ZeroAggregator(Aggregator):
                  qk_norm=True, 
                  rope_freq=100, 
                  init_values=0.01,
-                 enable_checkpoint=True):
+                 enable_checkpoint=True,
+                 depth_all_views=False):
         super().__init__(img_size, 
                          patch_size, 
                          embed_dim, 
@@ -59,6 +60,7 @@ class ZeroAggregator(Aggregator):
         
         self.cam_drop_prob = cam_drop_prob
         self.depth_drop_prob = depth_drop_prob
+        self.depth_all_views = depth_all_views  # training: auxiliary depth on every view (RGB-D-only use)
         self.patch_start_idx = 1 + num_register_tokens
         self.depth_placeholder = nn.Parameter(torch.zeros(1, 1, embed_dim))
         
@@ -164,12 +166,19 @@ class ZeroAggregator(Aggregator):
         idx = rng.choice(S, size=k, replace=False)
 
         return sorted(idx.tolist())
+
+    def training_depth_gt_index(self, S, rng=None):
+        """Views that receive the auxiliary depth in a training forward."""
+        if self.depth_all_views:
+            return list(range(S))
+        return self.select_depth_gt(S, self.depth_drop_prob, rng=rng)
     
     def forward(self, images: torch.Tensor, 
                 extrinsics: torch.Tensor, 
                 intrinsics: torch.Tensor,
                 depth: torch.Tensor,
-                mask: torch.Tensor,) -> Tuple[List[torch.Tensor], int]:
+                mask: torch.Tensor,
+                modality_rng=None) -> Tuple[List[torch.Tensor], int]:
         B, S, C_in, H, W = images.shape
         
         if C_in != 3:
@@ -191,8 +200,9 @@ class ZeroAggregator(Aggregator):
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
         register_token = slice_expand_and_flatten(self.register_token, B, S)
 
-        camera_gt_index = self.select_camera_gt(S, self.cam_drop_prob)
-        depth_gt_index  = self.select_depth_gt(S, self.depth_drop_prob)
+        # which views get the auxiliary camera / depth (modality_rng: keyed generator from the training loop)
+        camera_gt_index = self.select_camera_gt(S, self.cam_drop_prob, rng=modality_rng)
+        depth_gt_index  = self.training_depth_gt_index(S, rng=modality_rng)
         
         if len(camera_gt_index) != 0:
             camera_gt_length = len(camera_gt_index)

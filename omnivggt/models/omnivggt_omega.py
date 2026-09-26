@@ -38,6 +38,7 @@ class OmniVGGTOmega(nn.Module, PyTorchModelHubMixin):
         embed_dim=1024,
         cam_drop_prob=0.1,
         depth_drop_prob=0.1,
+        depth_all_views=False,
         num_register_tokens=16,
         register_attention_layers=(2, 6, 9, 14, 20),
         global_rope=False,
@@ -54,6 +55,7 @@ class OmniVGGTOmega(nn.Module, PyTorchModelHubMixin):
             pose_hidden_dim=9,
             cam_drop_prob=cam_drop_prob,
             depth_drop_prob=depth_drop_prob,
+            depth_all_views=depth_all_views,
             num_register_tokens=num_register_tokens,
             register_attention_layers=tuple(register_attention_layers),
             global_rope=global_rope,
@@ -75,11 +77,13 @@ class OmniVGGTOmega(nn.Module, PyTorchModelHubMixin):
         variant = json.loads(Path(path).read_text())
         return cls(**{key: variant[key] for key in VARIANT_KEYS}, **kwargs)
 
-    def forward(self, images, extrinsics=None, intrinsics=None, depth=None, mask=None, return_points=True):
+    def forward(self, images, extrinsics=None, intrinsics=None, depth=None, mask=None, return_points=True,
+                modality_rng=None):
         if images.ndim == 4:
             images = images.unsqueeze(0)
         tokens, patch_start_idx = self.aggregator(
-            images=images, extrinsics=extrinsics, intrinsics=intrinsics, depth=depth, mask=mask
+            images=images, extrinsics=extrinsics, intrinsics=intrinsics, depth=depth, mask=mask,
+            modality_rng=modality_rng,
         )
         return self._predict(tokens, patch_start_idx, images, return_points)
 

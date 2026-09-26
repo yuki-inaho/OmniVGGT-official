@@ -73,6 +73,34 @@ def build_dataset(
     return loader
 
 
+def optimizer_steps_per_epoch(local_batches: int, accumulation_steps: int) -> int:
+    """Optimizer steps per epoch; the epoch must hold a positive multiple of ``accumulation_steps`` micro-batches
+    (a remainder would add an under-scaled extra step and shift the schedule and resume positions)."""
+    if accumulation_steps < 1 or local_batches < accumulation_steps or local_batches % accumulation_steps:
+        raise ValueError(f"{local_batches} micro-batches per epoch is not a positive multiple of "
+                         f"gradient_accumulation_steps={accumulation_steps}; set steps_per_epoch to a multiple")
+    return local_batches // accumulation_steps
+
+
+def modality_rng(seed: int, rank: int, epoch: int, micro_step: int) -> np.random.Generator:
+    """Generator for the training-time choice of views that get the auxiliary camera/depth. Keyed by the
+    micro-batch, so a run replays from its seed and a resumed run sees the choices of an uninterrupted one."""
+    return np.random.default_rng([int(seed), int(rank), int(epoch), int(micro_step)])
+
+
+def start_epoch(train_dataloader, epoch: int) -> None:
+    """Select the data order of ``epoch``. accelerate's DataLoaderShard re-applies its own epoch counter on
+    every ``__iter__`` (it starts at 0 in a new process), so the epoch must be set on the loader itself;
+    setting it on the dataset or sampler would be overridden and a resumed run would replay epoch 0."""
+    train_dataloader.set_epoch(epoch)
+
+
+def resume_skip(global_step: int, local_steps_per_epoch: int, accumulation_steps: int) -> Tuple[int, int]:
+    """(optimizer steps already done in the current epoch, micro-batches to skip to resume after them)."""
+    step_in_epoch = global_step % local_steps_per_epoch
+    return step_in_epoch, step_in_epoch * accumulation_steps
+
+
 def build_cosine_warmup_scheduler(
     optimizer: torch.optim.Optimizer,
     warmup_steps: int,
@@ -201,31 +229,60 @@ def build_model(cfg: Any) -> torch.nn.Module:
                         cam_drop_prob=cfg.get("cam_drop_prob", 0.1),
                         depth_drop_prob=cfg.get("depth_drop_prob", 0.1))
     if name == "omnivggt_omega":
-        if cfg.get("init_checkpoint"):
-            raise ValueError("omnivggt_omega is initialised from its variant's weight map; do not set init_checkpoint")
         variant = cfg.get("omega_variant")
         if not variant:
             raise ValueError("model_name=omnivggt_omega needs omega_variant (a variant JSON)")
         torch.manual_seed(cfg.get("seed", weight_transfer.DEFAULT_SEED))  # initial values of parameters declared new
         return OmniVGGTOmega.from_variant(_repo_path(variant),
                                           cam_drop_prob=cfg.get("cam_drop_prob", 0.1),
-                                          depth_drop_prob=cfg.get("depth_drop_prob", 0.1))
+                                          depth_drop_prob=cfg.get("depth_drop_prob", 0.1),
+                                          depth_all_views=cfg.get("depth_all_views", False))
     raise ValueError(f"unknown model_name {name!r}")
+
+
+def _write_initial_weights_report(report: dict, variant_path: Path, cfg: Any) -> None:
+    """Record where the starting weights of an OmniVGGTOmega run came from (read back by the evaluation tool)."""
+    report["variant"] = {"file": variant_path.name, "sha256": weight_transfer.sha256_of(variant_path),
+                         "seed": cfg.get("seed", 42), "content": json.loads(variant_path.read_text())}
+    output_dir = Path(cfg.get("output_dir", "outputs"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "weight_transfer_report.json").write_text(json.dumps(report, indent=1) + "\n")
 
 
 def load_variant_weights(model: torch.nn.Module, cfg: Any) -> str:
     """Non-strict, audited load of an OmniVGGTOmega variant from the checkpoints its weight map names."""
     variant_path = _repo_path(cfg.get("omega_variant"))
-    variant = json.loads(variant_path.read_text())
     weight_map = weight_transfer.load_map(weight_transfer.variant_map_path(variant_path))
     sources, files = weight_transfer.load_sources(weight_map)
-    report = weight_transfer.transfer_weights(model, weight_map, sources, files=files)
-    report["variant"] = {"file": variant_path.name, "sha256": weight_transfer.sha256_of(variant_path),
-                         "seed": cfg.get("seed", 42), "content": variant}
-    output_dir = Path(cfg.get("output_dir", "outputs"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "weight_transfer_report.json").write_text(json.dumps(report, indent=1) + "\n")
+    _write_initial_weights_report(weight_transfer.transfer_weights(model, weight_map, sources, files=files),
+                                  variant_path, cfg)
     return f"weight_map:{weight_map['name']} (variant {variant_path.name})"
+
+
+def load_omega_checkpoint(model: torch.nn.Module, cfg: Any) -> str:
+    """Strict load of a trained OmniVGGTOmega checkpoint of the same variant (a checkpoint directory or its
+    ``model.safetensors``), e.g. to continue training at another resolution; the weight map is not used."""
+    variant_path = _repo_path(cfg.get("omega_variant"))
+    path = Path(cfg.get("init_checkpoint"))
+    if path.is_dir():
+        path = path / "model.safetensors"
+    if not path.is_file():
+        raise FileNotFoundError(f"init_checkpoint does not exist: {path}")
+    # Variants with the same parameters (e.g. differing only in RoPE) load strictly into each other, so check
+    # the variant recorded by the run that wrote the checkpoint (<output_dir>/<exp>/<checkpoint>/model.safetensors).
+    source_report = path.parent.parent.parent / "weight_transfer_report.json"
+    source_variant = "unverified"
+    if source_report.is_file():
+        recorded = json.loads(source_report.read_text())["variant"]
+        source_variant = {"file": recorded["file"], "sha256": recorded["sha256"]}
+        if source_variant["sha256"] != weight_transfer.sha256_of(variant_path):
+            raise ValueError(f"init_checkpoint was trained with variant {recorded['file']}, not {variant_path.name}")
+    state = load_safetensors(str(path))
+    model.load_state_dict(state, strict=True)
+    record = {"file": f"{path.parent.name}/{path.name}", "sha256": weight_transfer.sha256_of(path), "tensors": len(state),
+              "source_variant": source_variant}
+    _write_initial_weights_report({"init_checkpoint": record}, variant_path, cfg)
+    return f"init_checkpoint:{record['file']} (variant {variant_path.name})"
 
 
 def load_initial_weights(model: torch.nn.Module, cfg: Any) -> str:
@@ -234,10 +291,11 @@ def load_initial_weights(model: torch.nn.Module, cfg: Any) -> str:
     ``init_checkpoint`` (a local ``.safetensors`` file, e.g. the released OmniVGGT
     weights) is loaded strictly and must exist; otherwise the original
     ``model_url`` behaviour (VGGT-1B from the hub) is used. OmniVGGTOmega variants
-    are loaded through their weight map instead.
+    are loaded through their weight map, or strictly from ``init_checkpoint`` when it
+    names a trained OmniVGGTOmega checkpoint.
     """
     if cfg.get("model_name", "omnivggt") == "omnivggt_omega":
-        return load_variant_weights(model, cfg)
+        return load_omega_checkpoint(model, cfg) if cfg.get("init_checkpoint") else load_variant_weights(model, cfg)
     init_checkpoint = cfg.get("init_checkpoint")
     if init_checkpoint:
         path = Path(init_checkpoint)
@@ -272,7 +330,8 @@ def load_model(cfg: Any, device: torch.device) -> Tuple[OmniVGGT, torch.dtype]:
     """
     logger.info(f"Initializing {cfg.get('model_name', 'omnivggt')} model...")
     model = build_model(cfg)
-    logger.info(f"cam_drop_prob={model.aggregator.cam_drop_prob} depth_drop_prob={model.aggregator.depth_drop_prob}")
+    logger.info(f"cam_drop_prob={model.aggregator.cam_drop_prob} depth_drop_prob={model.aggregator.depth_drop_prob} "
+                f"depth_all_views={getattr(model.aggregator, 'depth_all_views', False)}")
 
     # Print network parameters and their indices
     # logger.info("Network parameters and their indices:")

@@ -105,3 +105,15 @@ def test_samples_must_follow_anchor_order():
     candidate["samples"] = candidate["samples"][::-1]
     with pytest.raises(ValueError, match="order"):
         compare_eval.compare(_eval(BASE), candidate, _thresholds())
+
+
+def test_rgbd_thresholds_match_preregistered():
+    """The RGB-D judgement uses the pre-registered numbers, restricted to the conditions with depth input."""
+    registered = json.loads((ROOT / "configs/omnivggt_omega/equivalence_thresholds.json").read_text())
+    rgbd = json.loads((ROOT / "configs/omnivggt_omega/equivalence_thresholds_rgbd.json").read_text())
+    assert rgbd["metrics"] == registered["metrics"]
+    assert rgbd["bootstrap"] == registered["bootstrap"]
+    assert rgbd["conditions"] == ["depth", "depth+camera"]
+    assert set(rgbd["conditions"]) <= set(registered["conditions"])
+    result = compare_eval.compare(_eval(BASE), _eval(BASE), rgbd)
+    assert set(result["conditions"]) == {"depth", "depth+camera"} and result["all_pass"]

@@ -97,10 +97,84 @@ def test_load_model_omega_variant(omega_cfg):
     assert report["targets"]["new"]["keys"] == 0
 
 
-def test_init_checkpoint_and_variant_are_exclusive(omega_cfg):
+def _trained_checkpoint(tmp_path, extra=None, drop=None):
+    """A checkpoint directory as written by accelerate's save_state: <run>/<exp>/<name>/model.safetensors."""
+    torch.manual_seed(11)
+    trained = OmniVGGTOmega(**TINY_OMEGA).state_dict()
+    state = {k: v.contiguous() for k, v in trained.items() if k != drop}
+    state.update(extra or {})
+    directory = tmp_path / "prev_run" / "exp" / "final_checkpoint"
+    directory.mkdir(parents=True)
+    save_file(state, directory / "model.safetensors")
+    return directory, trained
+
+
+@pytest.mark.parametrize("as_file", [False, True])
+def test_omega_init_checkpoint_is_loaded_strictly_without_weight_map(omega_cfg, tmp_path, monkeypatch, as_file):
+    import eval_colmap_rgbd
+
     cfg, _, _ = omega_cfg
-    with pytest.raises(ValueError, match="init_checkpoint"):
-        train_utils.load_model({**cfg, "init_checkpoint": "w.safetensors"}, torch.device("cpu"))
+    monkeypatch.delenv("TEST_INIT_OMNI")  # the weight map (and its sources) must not be used
+    directory, trained = _trained_checkpoint(tmp_path)
+    checkpoint = directory / "model.safetensors" if as_file else directory
+    model, _ = train_utils.load_model({**cfg, "init_checkpoint": str(checkpoint)}, torch.device("cpu"))
+    for key, value in trained.items():
+        assert torch.equal(model.state_dict()[key], value), key
+    report = json.loads(Path(cfg["output_dir"], "weight_transfer_report.json").read_text())
+    assert report["init_checkpoint"]["file"] == "final_checkpoint/model.safetensors"
+    assert len(report["init_checkpoint"]["sha256"]) == 64 and report["init_checkpoint"]["tensors"] == len(trained)
+    assert report["variant"]["sha256"] == train_utils.weight_transfer.sha256_of(Path(cfg["omega_variant"]))
+    new_checkpoint = Path(cfg["output_dir"], "exp", "final_checkpoint")
+    new_checkpoint.mkdir(parents=True)
+    assert eval_colmap_rgbd._check_variant_provenance(Path(cfg["omega_variant"]), new_checkpoint) == "verified"
+
+
+def _write_source_report(directory, variant_sha256):
+    report = directory.parent.parent / "weight_transfer_report.json"
+    report.write_text(json.dumps({"variant": {"file": "V5.json", "sha256": variant_sha256}}))
+
+
+def test_omega_init_checkpoint_records_the_source_variant(omega_cfg, tmp_path):
+    cfg, _, _ = omega_cfg
+    directory, _ = _trained_checkpoint(tmp_path)
+    sha = train_utils.weight_transfer.sha256_of(Path(cfg["omega_variant"]))
+    _write_source_report(directory, sha)
+    train_utils.load_model({**cfg, "init_checkpoint": str(directory)}, torch.device("cpu"))
+    report = json.loads(Path(cfg["output_dir"], "weight_transfer_report.json").read_text())
+    assert report["init_checkpoint"]["source_variant"] == {"file": "V5.json", "sha256": sha}
+
+
+def test_omega_init_checkpoint_from_another_variant_raises(omega_cfg, tmp_path):
+    cfg, _, _ = omega_cfg
+    directory, _ = _trained_checkpoint(tmp_path)
+    _write_source_report(directory, "0" * 64)
+    with pytest.raises(ValueError, match="variant"):
+        train_utils.load_model({**cfg, "init_checkpoint": str(directory)}, torch.device("cpu"))
+
+
+def test_omega_init_checkpoint_without_source_report_is_unverified(omega_cfg, tmp_path):
+    cfg, _, _ = omega_cfg
+    directory, _ = _trained_checkpoint(tmp_path)
+    train_utils.load_model({**cfg, "init_checkpoint": str(directory / "model.safetensors")}, torch.device("cpu"))
+    report = json.loads(Path(cfg["output_dir"], "weight_transfer_report.json").read_text())
+    assert report["init_checkpoint"]["source_variant"] == "unverified"
+
+
+@pytest.mark.parametrize("change", ["missing", "unexpected"])
+def test_omega_init_checkpoint_with_mismatched_keys_raises(omega_cfg, tmp_path, change):
+    cfg, _, _ = omega_cfg
+    if change == "missing":
+        directory, _ = _trained_checkpoint(tmp_path, drop="aggregator.camera_token")
+    else:
+        directory, _ = _trained_checkpoint(tmp_path, extra={"point_head.extra": torch.zeros(1)})
+    with pytest.raises(RuntimeError, match=r"Missing key|Unexpected key"):
+        train_utils.load_model({**cfg, "init_checkpoint": str(directory)}, torch.device("cpu"))
+
+
+def test_omega_missing_init_checkpoint_raises(omega_cfg, tmp_path):
+    cfg, _, _ = omega_cfg
+    with pytest.raises(FileNotFoundError):
+        train_utils.load_model({**cfg, "init_checkpoint": str(tmp_path / "nope")}, torch.device("cpu"))
 
 
 def test_unknown_model_name_raises(omega_cfg):

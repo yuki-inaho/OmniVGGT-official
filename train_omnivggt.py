@@ -31,9 +31,13 @@ from train_utils import (
     setup_wandb,
     setup_tensorboard,
     load_model,
+    modality_rng,
     build_optimizer,
     build_loss_criterion,
+    optimizer_steps_per_epoch,
     resume_position,
+    resume_skip,
+    start_epoch,
 )
 
 logger = get_logger(__name__, log_level="INFO")
@@ -113,9 +117,9 @@ if __name__ == '__main__':
     # NOW calculate training steps based on ACTUAL sharded dataloader
     # After prepare(), len(train_dataloader) returns the LOCAL length for this process
     world_size = accelerator.num_processes
-    gradient_accumulation_steps = cfg.get("gradient_accumulation_steps", 2)
+    gradient_accumulation_steps = accelerator.gradient_accumulation_steps  # also scales the loss in backward()
     actual_local_batches = len(train_dataloader)
-    local_steps_per_epoch = actual_local_batches // gradient_accumulation_steps
+    local_steps_per_epoch = optimizer_steps_per_epoch(actual_local_batches, gradient_accumulation_steps)
     total_training_steps = cfg.get('num_train_epochs') * local_steps_per_epoch
     
     logger.info("Training steps calculation (AFTER Accelerate sharding):")
@@ -179,7 +183,7 @@ if __name__ == '__main__':
     # ======================================================
     global_step = initial_step
     optimizer.train()  # AMUSE computes gradients at y; no-op for AdamW
-    accumulation_steps = cfg.get("gradient_accumulation_steps", 2)
+    accumulation_steps = gradient_accumulation_steps
     
     for epoch in range(initial_epoch, cfg.get('num_train_epochs')):
         logger.info("=" * 60)
@@ -188,16 +192,13 @@ if __name__ == '__main__':
         
         model.train()
         
-        # Set epoch for proper shuffling in distributed training
-        if hasattr(train_dataloader, 'dataset') and hasattr(train_dataloader.dataset, 'set_epoch'):
-            train_dataloader.dataset.set_epoch(epoch)
-        if hasattr(train_dataloader, 'sampler') and hasattr(train_dataloader.sampler, 'set_epoch'):
-            train_dataloader.sampler.set_epoch(epoch)
+        # Set epoch for proper shuffling (also when resuming in a new process)
+        start_epoch(train_dataloader, epoch)
         
         if epoch == initial_epoch:
-            step_in_epoch = global_step % local_steps_per_epoch
+            step_in_epoch, skip_micro_batches = resume_skip(global_step, local_steps_per_epoch, accumulation_steps)
         else:
-            step_in_epoch = 0
+            step_in_epoch, skip_micro_batches = 0, 0
         
         progress_bar = tqdm(
             total=local_steps_per_epoch,
@@ -206,13 +207,14 @@ if __name__ == '__main__':
             disable=not accelerator.is_local_main_process,
         )
         
-        # Build iterator so we can skip already completed batches when resuming
-        if step_in_epoch > 0:
-            logger.info(f"Skipping {step_in_epoch} batches to resume within epoch {epoch + 1}")
-        train_iter = itertools.islice(train_dataloader, step_in_epoch, None)
+        # Build iterator so we can skip already completed micro-batches when resuming
+        if skip_micro_batches > 0:
+            logger.info(f"Skipping {skip_micro_batches} micro-batches ({step_in_epoch} optimizer steps) "
+                        f"to resume within epoch {epoch + 1}")
+        train_iter = itertools.islice(train_dataloader, skip_micro_batches, None)
         
-        # Training loop for this epoch
-        for step, batch in enumerate(train_iter, start=step_in_epoch):
+        # Training loop for this epoch (step counts micro-batches)
+        for step, batch in enumerate(train_iter, start=skip_micro_batches):
             batch = merge_dicts(batch)
             
             # Normalize camera extrinsics and points for loss computation
@@ -242,7 +244,8 @@ if __name__ == '__main__':
                 'depth': input_depths,
                 'mask': input_mask
             }
-            predictions = model(**inputs)
+            predictions = model(**inputs, modality_rng=modality_rng(cfg.get("seed", 42), accelerator.process_index,
+                                                                    epoch, step))
             
             # Compute loss
             loss_details = {}

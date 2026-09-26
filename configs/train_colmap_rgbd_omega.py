@@ -4,7 +4,8 @@
 # Same recipe as configs/train_colmap_rgbd.py (OmniVGGT) except:
 #   * model_name = "omnivggt_omega": VGGT-Omega style inter-frame attention (see the variant JSON)
 #   * no point head: the point loss is computed on points unprojected from depth and camera
-#   * initial weights come from the variant's weight map (audited non-strict load), not init_checkpoint
+#   * initial weights come from the variant's weight map (audited non-strict load), or strictly from a
+#     trained OmniVGGTOmega checkpoint of the same variant (OMNIVGGT_INIT_CHECKPOINT)
 # Paths and run-size knobs come from environment variables (mmengine substitutes {{$VAR:default}}):
 #   OMNIVGGT_COLMAP_RGBD_ROOTS    comma-separated colmap_rgbd_v1 roots (required)
 #   OMNIVGGT_OMEGA_VARIANT        variant JSON, e.g. configs/omnivggt_omega/variants/V4.json (required)
@@ -15,9 +16,16 @@
 #   OMNIVGGT_STEPS_PER_EPOCH      samples per epoch drawn from the train split (default: 1000)
 #   OMNIVGGT_PATCH_EMBED_FREEZE   1 freezes the DINOv2 patch embedding (default: 0)
 #   OMNIVGGT_OPTIMIZER            adamw (default) or amuse
+#   OMNIVGGT_RESOLUTION           training resolution WxH, multiples of 14 (default: 392x294)
+#   OMNIVGGT_DEPTH_DROP_PROB      probability of hiding the auxiliary depth from a whole sample (default: 0.3);
+#                                 otherwise it goes to a random subset of the views
+#   OMNIVGGT_DEPTH_ALL_VIEWS      1 gives the auxiliary depth to every view in training (RGB-D-only use; default: 0)
+#   OMNIVGGT_GRAD_ACCUM           micro-batches per optimizer step (default: 1)
+#   OMNIVGGT_INIT_CHECKPOINT      trained OmniVGGTOmega checkpoint of the same variant to start from (default: none)
 #
 # The image encoder is OmniVGGT's DINOv2 (14-pixel patches), so the 384x288 staging images are
-# trained at 392x294 exactly as for OmniVGGT (same 4:3 aspect ratio, 28x21 patches).
+# trained at 392x294 exactly as for OmniVGGT (same 4:3 aspect ratio, 28x21 patches); 640x480 staging
+# images are trained at 644x476 (46x34 patches, the nearest multiples of 14).
 
 _roots = "{{$OMNIVGGT_COLMAP_RGBD_ROOTS:}}"
 if not _roots:
@@ -27,6 +35,8 @@ omega_variant = "{{$OMNIVGGT_OMEGA_VARIANT:}}"
 if not omega_variant:
     raise ValueError("set OMNIVGGT_OMEGA_VARIANT to a variant JSON (configs/omnivggt_omega/variants/*.json)")
 model_name = "omnivggt_omega"
+_init_checkpoint = "{{$OMNIVGGT_INIT_CHECKPOINT:none}}"  # mmengine treats an empty default as "required"
+init_checkpoint = None if _init_checkpoint == "none" else _init_checkpoint
 
 # == Common Configuration ==
 output_dir = "{{$OMNIVGGT_OUTPUT_DIR:outputs}}"
@@ -51,10 +61,11 @@ enable_camera = True
 mixed_precision = "bf16"
 seed = 42
 num_train_epochs = 2
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = int("{{$OMNIVGGT_GRAD_ACCUM:1}}")
 max_grad_norm = 1.0
 cam_drop_prob = 0.1
-depth_drop_prob = 0.3
+depth_drop_prob = float("{{$OMNIVGGT_DEPTH_DROP_PROB:0.3}}")
+depth_all_views = bool(int("{{$OMNIVGGT_DEPTH_ALL_VIEWS:0}}"))
 save_each_epoch = True
 patch_embed_freeze = bool(int("{{$OMNIVGGT_PATCH_EMBED_FREEZE:0}}"))
 
@@ -62,6 +73,8 @@ patch_embed_freeze = bool(int("{{$OMNIVGGT_PATCH_EMBED_FREEZE:0}}"))
 train_batch_images = int("{{$OMNIVGGT_TRAIN_BATCH_IMAGES:12}}")
 num_workers = 8
 steps_per_epoch = int("{{$OMNIVGGT_STEPS_PER_EPOCH:1000}}")
+if steps_per_epoch % gradient_accumulation_steps:
+    raise ValueError("OMNIVGGT_STEPS_PER_EPOCH (micro-batches per epoch) must be a multiple of OMNIVGGT_GRAD_ACCUM")
 
 # == Optimizer Configuration ==
 optimizer_type = "{{$OMNIVGGT_OPTIMIZER:adamw}}"  # "adamw" (cosine schedule below) or "amuse" (schedule-free)
@@ -111,7 +124,10 @@ save_glb_visualization = False
 # == Resume Configuration ==
 resume_model_path = None
 
-resolution = [(392, 294)]
+_resolution = "{{$OMNIVGGT_RESOLUTION:392x294}}".split("x")
+if len(_resolution) != 2 or not all(v.isdigit() and int(v) % 14 == 0 for v in _resolution):
+    raise ValueError(f"OMNIVGGT_RESOLUTION must be WxH in multiples of 14, got {'x'.join(_resolution)!r}")
+resolution = [(int(_resolution[0]), int(_resolution[1]))]
 train_dataset = (
     f"{steps_per_epoch} @ ColmapRgbd(roots={colmap_rgbd_roots!r}, split='train', top_k=32, z_far=2, "
     f"aug_crop=16, resolution={resolution}, transform=ColorJitter, seed=985)"

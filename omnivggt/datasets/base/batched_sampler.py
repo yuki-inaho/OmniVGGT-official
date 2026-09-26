@@ -122,10 +122,14 @@ class AnchorFrameSampler(BatchedRandomSampler):
             valid_lengths = [1, 2, 4, 8]
         elif self.image_num_batch == 12:
             valid_lengths = [1, 2, 4, 6]
+        elif self.image_num_batch == 8:
+            valid_lengths = [1, 2, 4]
+        elif self.image_num_batch == 6:
+            valid_lengths = [1, 2, 3]
         elif self.image_num_batch == 4:
             valid_lengths = [1, 2]
         else:
-            raise ValueError(f"Invalid train_batch_images: {self.train_batch_images}")
+            raise ValueError(f"Invalid train_batch_images: {self.image_num_batch}")
 
         # Note: Distribution is now handled by Accelerate, not here
         # When world_size=1 and rank=0, we process all samples
