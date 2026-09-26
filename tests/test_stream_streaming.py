@@ -9,7 +9,7 @@ from omnivggt.layers.block import Block
 from omnivggt.layers.rope import PositionGetter, RotaryPositionEmbedding2D
 from omnivggt.stream.kv_cache import CachePolicy, LayerKVCache
 from omnivggt.stream.masks import frame_causal_mask
-from omnivggt.stream.streaming import StreamingOmega, stream_block
+from omnivggt.stream.streaming import StreamingOmega, all_caches, stream_block
 
 # --- stream_block --------------------------------------------------------------------------------------------
 
@@ -216,6 +216,32 @@ def test_first_frame_without_valid_depth_raises():
     with pytest.raises(ValueError, match="valid"):
         stream.step(*_frame_inputs(sequence, 0, "depth"))
     assert stream.t == 0 and _contexts_unset(stream.model)
+
+
+def _cache_storages(stream):
+    return {tensor.untyped_storage().data_ptr() for cache in all_caches(stream.caches) for tensor in cache.read()}
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_stream_outputs_ignore_later_frames(condition):
+    model, sequence, other = _causal_model(), _sequence(), _sequence(seed=1)
+    stream = StreamingOmega(model, CachePolicy.full())
+    past = [stream.step(*_frame_inputs(sequence, frame, condition)) for frame in range(STREAM_FRAMES - 1)]
+    saved = [{key: value.clone() for key, value in step.items()} for step in past]
+    changed_last = stream.step(*_frame_inputs(other, STREAM_FRAMES - 1, condition))
+    storages = _cache_storages(stream)
+    for step, step_saved in zip(past, saved, strict=True):  # returned outputs are not views of the caches
+        for key in OUTPUTS:
+            assert torch.equal(step[key], step_saved[key]), key
+            assert step[key].untyped_storage().data_ptr() not in storages, key
+    runs = [[stream.step(*_frame_inputs(sequence, frame, condition)) for frame in range(STREAM_FRAMES)]
+            for stream in (StreamingOmega(model, CachePolicy.full()), StreamingOmega(model, CachePolicy.full()))]
+    for frame in range(STREAM_FRAMES):
+        for key in OUTPUTS:  # the same input twice gives the same bits
+            assert torch.equal(runs[0][frame][key], runs[1][frame][key]), (frame, key)
+            if frame < STREAM_FRAMES - 1:  # another frame 5 leaves frames 1-4 alone
+                assert torch.equal(runs[0][frame][key], saved[frame][key]), (frame, key)
+    assert not torch.equal(runs[0][-1]["pose_enc"], changed_last["pose_enc"])
 
 
 def test_frames_of_another_size_raise():
